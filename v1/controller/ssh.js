@@ -2,6 +2,7 @@ import { Client } from 'ssh2';
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import dns from 'dns';
 import { getBootstrapScript } from './bootstrap.js';
 
 let sshConnection = null;
@@ -15,8 +16,77 @@ function getConfig() {
     privateKey: process.env.VAST_SSH_KEY_PATH 
       ? readFileSync(process.env.VAST_SSH_KEY_PATH.replace('~', homedir()))
       : undefined,
-    password: process.env.VAST_PASSWORD
+    password: process.env.VAST_PASSWORD,
+    readyTimeout: parseInt(process.env.VAST_SSH_READY_TIMEOUT_MS || '30000'),
+    keepaliveInterval: parseInt(process.env.VAST_SSH_KEEPALIVE_INTERVAL_MS || '10000'),
+    keepaliveCountMax: parseInt(process.env.VAST_SSH_KEEPALIVE_COUNT_MAX || '3')
   };
+}
+
+function isRetryableConnectError(err) {
+  const codes = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH']);
+  if (!err) return false;
+  if (typeof err.code === 'string' && codes.has(err.code)) return true;
+  const msg = (err.message || '').toLowerCase();
+  return msg.includes('econnrefused') || msg.includes('econnreset') || msg.includes('timed out');
+}
+
+async function resolveHostAddresses(host) {
+  try {
+    const results = await dns.promises.lookup(host, { all: true });
+    const addresses = results.map(r => r.address).filter(Boolean);
+    if (addresses.length > 0) return addresses;
+  } catch {
+    // ignore and fall back to host as-is
+  }
+  return [host];
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function connectOnce(config, options = {}) {
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
+
+    conn.on('ready', () => {
+      sshConnection = conn;
+      resolve(conn);
+    });
+
+    conn.on('error', (err) => {
+      reject(err);
+    });
+
+    conn.connect(config);
+  });
+}
+
+async function connectWithRetry(baseConfig, options = {}) {
+  const maxAttempts = parseInt(process.env.VAST_SSH_CONNECT_RETRIES || '5');
+  const addresses = await resolveHostAddresses(baseConfig.host);
+
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    for (const hostAddress of addresses) {
+      const config = { ...baseConfig, host: hostAddress };
+      try {
+        const conn = await connectOnce(config, options);
+        return { conn, connectedHost: hostAddress };
+      } catch (err) {
+        lastErr = err;
+        if (!isRetryableConnectError(err)) {
+          throw err;
+        }
+      }
+    }
+
+    const backoffMs = Math.min(2000 * attempt, 10000);
+    await sleep(backoffMs);
+  }
+
+  throw lastErr || new Error('SSH connection failed');
 }
 
 export async function connect(options = {}) {
@@ -31,28 +101,20 @@ export async function connect(options = {}) {
   }
   
   connectionConfig = config;
-  
-  return new Promise((resolve, reject) => {
-    const conn = new Client();
-    
-    conn.on('ready', async () => {
-      console.log('  SSH connection established');
-      sshConnection = conn;
-      
-      try {
-        await bootstrap(conn, options);
-        resolve({ connected: true, host: config.host });
-      } catch (error) {
-        reject(error);
-      }
-    });
-    
-    conn.on('error', (err) => {
-      reject(new Error(`SSH connection failed: ${err.message}`));
-    });
-    
-    conn.connect(config);
-  });
+
+  try {
+    const { conn, connectedHost } = await connectWithRetry(config, options);
+    console.log('  SSH connection established');
+
+    try {
+      await bootstrap(conn, options);
+      return { connected: true, host: connectedHost };
+    } catch (error) {
+      throw error;
+    }
+  } catch (err) {
+    throw new Error(`SSH connection failed: ${err.message}`);
+  }
 }
 
 async function bootstrap(conn, options = {}) {

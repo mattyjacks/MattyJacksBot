@@ -41,6 +41,8 @@ Example (Matt's instance, Vast proxy SSH):
 ssh -p 34078 root@ssh1.vast.ai -i C:\Users\ventu\.ssh\id_ed25519 -L 3333:localhost:3333 -L 18789:localhost:18789
 ```
 
+Note: Vast proxy SSH can be intermittent. If the CLI shows `ECONNREFUSED` or `ECONNRESET` but manual `ssh` works, retry. The v1 controller will also retry connections automatically.
+
 - **`-L 3333:localhost:3333`** forwards the v1 web UI
   - Open: `http://localhost:3333`
 - **`-L 18789:localhost:18789`** forwards the OpenClaw gateway
@@ -58,6 +60,24 @@ Example:
 MODEL_OVERRIDE=qwen2.5-coder:7b
 ```
 
+#### Qwen3 (general, non-coder) VRAM recommendations (Ollama tags)
+
+These are the exact tags from Ollama's model library for the general Qwen3 family (not qwen3-coder):
+
+| GPU VRAM | Recommended Qwen3 tag | Notes |
+| --- | --- | --- |
+| 4GB to 6GB | `qwen3:4b` | Small, fast, good for basic chat and tools |
+| 6GB to 10GB | `qwen3:8b` | Strong default for most tasks |
+| 10GB to 16GB | `qwen3:14b` | Higher quality, more VRAM pressure |
+| 16GB to 24GB | `qwen3:30b` or `qwen3:32b` | Best quality in this range, can be slower |
+| 24GB+ | `qwen3:30b` or `qwen3:32b` | Usually the practical ceiling for single GPU Ollama |
+
+To force Qwen3 (general) in v1:
+
+```env
+MODEL_OVERRIDE=qwen3:8b
+```
+
 ### Vast.ai "Terminal Connection Options" - how to read it
 
 Vast typically shows two SSH options:
@@ -66,6 +86,8 @@ Vast typically shows two SSH options:
 - **Proxy ssh connect**: `ssh -p <PORT> <USER>@ssh1.vast.ai`
 
 If you get `Connection refused` with the direct IP connection, use the proxy option.
+
+When using proxy SSH, keep `VAST_HOST` set to the hostname `ssh1.vast.ai` (not the resolved IP), because the proxy backend can rotate.
 
 Vast shows SSH connection details like:
 
