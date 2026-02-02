@@ -26,8 +26,75 @@ copy .env.example .env
 # Edit .env with your Vast.ai SSH details
 
 npm run cli -- connect   # Bootstrap the instance
+# Note: first-time bootstrap can take a while and may require running this command twice.
+# The first run can still be doing installs on the instance even if it looks like it stopped.
 npm run dev              # Start GUI at http://localhost:3333
 ```
+
+### SSH Tunnels (recommended)
+
+Use SSH tunnels to keep remote services bound to `localhost` on the Vast instance while still accessing them from your PC.
+
+Example (Matt's instance, Vast proxy SSH):
+
+```bash
+ssh -p 34078 root@ssh1.vast.ai -i C:\Users\ventu\.ssh\id_ed25519 -L 3333:localhost:3333 -L 18789:localhost:18789
+```
+
+- **`-L 3333:localhost:3333`** forwards the v1 web UI
+  - Open: `http://localhost:3333`
+- **`-L 18789:localhost:18789`** forwards the OpenClaw gateway
+  - Default gateway port in v1: `OPENCLAW_GATEWAY_PORT=18789`
+
+If you later host the UI on the Vast instance public URL, keep the gateway bound to loopback and expose only the UI, or expose via SSH tunnel.
+
+### Vast.ai "Terminal Connection Options" - how to read it
+
+Vast typically shows two SSH options:
+
+- **Direct ssh connect**: `ssh -p <PORT> <USER>@<INSTANCE_IP>`
+- **Proxy ssh connect**: `ssh -p <PORT> <USER>@ssh1.vast.ai`
+
+If you get `Connection refused` with the direct IP connection, use the proxy option.
+
+Vast shows SSH connection details like:
+
+```text
+ssh -p <PORT> <USER>@<HOST>
+```
+
+Map that to `v1/.env`:
+
+- **`<HOST>`** -> `VAST_HOST`
+- **`<PORT>`** -> `VAST_PORT`
+- **`<USER>`** -> `VAST_USER`
+
+Example:
+
+```text
+Direct ssh connect:
+ssh -p 52127 root@74.48.140.178
+
+Proxy ssh connect:
+ssh -p 34078 root@ssh1.vast.ai
+```
+
+becomes:
+
+```env
+VAST_HOST=ssh1.vast.ai
+VAST_PORT=34078
+VAST_USER=root
+VAST_SSH_KEY_PATH=C:\Users\ventu\.ssh\id_ed25519
+```
+
+If Vast shows a port forward like:
+
+```text
+-L 8080:localhost:8080
+```
+
+that means "map remote port `8080` to local port `8080`". You can add additional forwards for v1 services as needed.
 
 ### Architecture
 
