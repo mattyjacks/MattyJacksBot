@@ -176,14 +176,26 @@ function selectModelForVRAM(vramGB) {
   const midThreshold = parseInt(process.env.VRAM_THRESHOLD_MID || '12');
   const highThreshold = parseInt(process.env.VRAM_THRESHOLD_HIGH || '16');
   
+  const isCoder = family.toLowerCase().includes('coder');
+
+  if (isCoder) {
+    if (vramGB < lowThreshold) {
+      return `${family}:7b`;
+    } else if (vramGB < highThreshold) {
+      return `${family}:14b`;
+    } else {
+      return `${family}:30b`;
+    }
+  }
+
   if (vramGB < lowThreshold) {
-    return `${family}:7b-q4_K_M`;
+    return `${family}:4b`;
   } else if (vramGB < midThreshold) {
-    return `${family}:7b-q5_K_M`;
+    return `${family}:8b`;
   } else if (vramGB < highThreshold) {
-    return `${family}:14b-q4_K_M`;
+    return `${family}:14b`;
   } else {
-    return `${family}:14b-q5_K_M`;
+    return `${family}:30b`;
   }
 }
 
@@ -213,6 +225,36 @@ function buildModelCandidates(primaryModel) {
   return candidates;
 }
 
+function normalizeModelNameForOllamaCheck(model) {
+  if (!model) return '';
+  return model.includes(':') ? model : `${model}:latest`;
+}
+
+async function startOllamaPullBackground(model) {
+  const safeModel = model.replace(/"/g, '');
+  const cmd = `nohup bash -lc "ollama pull ${safeModel} > /tmp/ollama-pull.log 2>&1" >/dev/null 2>&1 & echo started`;
+  await executeRemote(cmd, { quiet: true });
+}
+
+async function isModelPresent(model) {
+  const normalized = normalizeModelNameForOllamaCheck(model);
+  const nameOnly = normalized.split(':')[0];
+  const out = await executeRemote('ollama list 2>/dev/null || true', { quiet: true });
+  const hay = out.toLowerCase();
+  return hay.includes(normalized.toLowerCase()) || hay.includes(`${nameOnly.toLowerCase()}:latest`);
+}
+
+async function waitForModel(model, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const present = await isModelPresent(model);
+    if (present) return;
+    await sleep(20000);
+  }
+  const tail = await executeRemote('tail -n 50 /tmp/ollama-pull.log 2>/dev/null || true', { quiet: true });
+  throw new Error(`Timed out waiting for model pull: ${model}. Tail of /tmp/ollama-pull.log:\n${tail}`);
+}
+
 async function pullModelForVRAM(vramGB) {
   const primaryModel = selectModelForVRAM(vramGB);
   const candidates = buildModelCandidates(primaryModel);
@@ -224,7 +266,9 @@ async function pullModelForVRAM(vramGB) {
       if (model !== primaryModel) {
         console.log(`  Trying fallback model: ${model}`);
       }
-      await executeRemote(`ollama pull ${model}`, { verbose: true });
+      const timeoutMs = parseInt(process.env.OLLAMA_PULL_TIMEOUT_MS || '21600000');
+      await startOllamaPullBackground(model);
+      await waitForModel(model, timeoutMs);
       await executeRemote(`echo "${model}" > ~/.openclaw/current_model`, { quiet: true });
       return;
     } catch (err) {
@@ -306,30 +350,30 @@ export async function executeRemote(command, options = {}) {
     await connect({ force: false, verbose: false });
   }
   
-  return new Promise((resolve, reject) => {
+  const runOnce = () => new Promise((resolve, reject) => {
     sshConnection.exec(command, (err, stream) => {
       if (err) {
         reject(err);
         return;
       }
-      
+
       let stdout = '';
       let stderr = '';
-      
+
       stream.on('data', (data) => {
         stdout += data.toString();
         if (verbose && !quiet) {
           process.stdout.write(data);
         }
       });
-      
+
       stream.stderr.on('data', (data) => {
         stderr += data.toString();
         if (verbose && !quiet) {
           process.stderr.write(data);
         }
       });
-      
+
       stream.on('close', (code) => {
         if (code !== 0 && !quiet) {
           reject(new Error(`Command failed with code ${code}: ${stderr}`));
@@ -339,6 +383,17 @@ export async function executeRemote(command, options = {}) {
       });
     });
   });
+
+  try {
+    return await runOnce();
+  } catch (err) {
+    if ((err?.message || '').toLowerCase().includes('not connected')) {
+      disconnect();
+      await connect({ force: false, verbose: false });
+      return await runOnce();
+    }
+    throw err;
+  }
 }
 
 export async function getConnectionStatus() {
