@@ -48,6 +48,16 @@ ssh -p 34078 root@ssh1.vast.ai -i C:\Users\ventu\.ssh\id_ed25519 -L 3333:localho
 
 If you later host the UI on the Vast instance public URL, keep the gateway bound to loopback and expose only the UI, or expose via SSH tunnel.
 
+### Model selection and overrides
+
+By default, v1 selects a Qwen coder model based on detected GPU VRAM. If `ollama pull` fails because a specific tag does not exist on your host, set `MODEL_OVERRIDE` in `v1/.env` to a model that you know works.
+
+Example:
+
+```env
+MODEL_OVERRIDE=qwen2.5-coder:7b
+```
+
 ### Vast.ai "Terminal Connection Options" - how to read it
 
 Vast typically shows two SSH options:

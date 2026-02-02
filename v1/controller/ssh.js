@@ -125,13 +125,57 @@ function selectModelForVRAM(vramGB) {
   }
 }
 
+function buildModelCandidates(primaryModel) {
+  const candidates = [];
+
+  const add = (m) => {
+    if (!m) return;
+    if (!candidates.includes(m)) candidates.push(m);
+  };
+
+  add(primaryModel);
+
+  const [name, tag] = primaryModel.split(':');
+  add(name);
+  add(`${name}:latest`);
+
+  if (tag) {
+    const fallbackName = name === 'qwen3-coder' ? 'qwen2.5-coder' : null;
+    if (fallbackName) {
+      add(`${fallbackName}:${tag}`);
+      add(fallbackName);
+      add(`${fallbackName}:latest`);
+    }
+  }
+
+  return candidates;
+}
+
 async function pullModelForVRAM(vramGB) {
-  const model = selectModelForVRAM(vramGB);
-  console.log(`  Pulling model: ${model}`);
-  
-  await executeRemote(`ollama pull ${model}`, { verbose: true });
-  
-  await executeRemote(`echo "${model}" > ~/.openclaw/current_model`, { quiet: true });
+  const primaryModel = selectModelForVRAM(vramGB);
+  const candidates = buildModelCandidates(primaryModel);
+  console.log(`  Pulling model: ${primaryModel}`);
+
+  let lastError = null;
+  for (const model of candidates) {
+    try {
+      if (model !== primaryModel) {
+        console.log(`  Trying fallback model: ${model}`);
+      }
+      await executeRemote(`ollama pull ${model}`, { verbose: true });
+      await executeRemote(`echo "${model}" > ~/.openclaw/current_model`, { quiet: true });
+      return;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw new Error(
+    `Model pull failed for all candidates. ` +
+    `Primary was "${primaryModel}". ` +
+    `Set MODEL_OVERRIDE in .env to a valid Ollama model name (for example, one that works with: ollama pull <model>). ` +
+    `Last error: ${lastError?.message || 'unknown error'}`
+  );
 }
 
 async function ensureModelPulled(vramGB) {
@@ -140,7 +184,7 @@ async function ensureModelPulled(vramGB) {
   const currentModel = await executeRemote('cat ~/.openclaw/current_model 2>/dev/null || echo ""', { quiet: true });
   
   if (currentModel.trim() !== model) {
-    console.log(`  Model mismatch, pulling: ${model}`);
+    console.log(`  Model mismatch, pulling: ${model} (set MODEL_OVERRIDE to force a specific tag)`);
     await pullModelForVRAM(vramGB);
   } else {
     console.log(`  Model ready: ${model}`);
