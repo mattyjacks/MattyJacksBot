@@ -181,6 +181,7 @@ async function bootstrap(conn, options = {}) {
     console.log(`  Detected VRAM: ${vram}GB`);
     
     await ensureModelPulled(vram);
+    await ensureOpenclawConfig();
     await ensureGatewayRunning();
     
     return;
@@ -368,71 +369,149 @@ async function ensureModelPulled(vramGB) {
 }
 
 async function ensureGatewayRunning() {
-  const running = await executeRemote('pgrep -f "openclaw gateway"', { quiet: true }).catch(() => '');
+  const running = await executeRemote(
+    'pgrep -f "openclaw-gateway" >/dev/null 2>&1 || pgrep -f "openclaw gateway" >/dev/null 2>&1; echo $?',
+    { quiet: true }
+  ).catch(() => '1');
   
-  if (!running.trim()) {
+  if (running.trim() !== '0') {
     console.log('  Starting OpenClaw gateway...');
     await startGateway();
   } else {
-    console.log('  Gateway already running');
+    const logPath = '/root/.openclaw/run/gateway.log';
+    const tail = await executeRemote(`tail -n 80 ${logPath} 2>/dev/null || true`, { quiet: true }).catch(() => '');
+    if (tail.includes('Invalid config at') || tail.includes('Config invalid')) {
+      console.log('  Gateway running but config is invalid, restarting...');
+      await startGateway();
+    } else if (tail.includes('No API key found for provider "ollama"')) {
+      console.log('  Gateway running but Ollama auth is missing, restarting...');
+      await startGateway();
+    } else if (tail.includes('Unknown model:')) {
+      console.log('  Gateway running but reports Unknown model, restarting...');
+      await startGateway();
+    } else {
+      console.log('  Gateway already running');
+    }
   }
 }
 
-function modelFamilyName() {
-  const family = (process.env.MODEL_FAMILY || 'qwen3').trim();
-  return family.split(':')[0];
+function getSelectedModel() {
+  return process.env.MODEL_OVERRIDE || process.env.SELECTED_MODEL || 'qwen3:8b';
 }
 
 async function ensureOpenclawConfig() {
   const workspace = process.env.OPENCLAW_WORKSPACE || '~/moltbook/v1/agent_runtime/workspace';
-  const family = modelFamilyName();
-
-  const hasLegacy = await executeRemote(
-    'test -f ~/.openclaw/openclaw.json && grep -q ' +
-      '"agent"' +
-      ' ~/.openclaw/openclaw.json && echo yes || echo no',
-    { quiet: true }
-  ).catch(() => 'no');
-
-  if (hasLegacy.trim() !== 'yes') return;
+  let model = getSelectedModel();
+  if (!process.env.MODEL_OVERRIDE && !process.env.SELECTED_MODEL) {
+    const currentModel = await executeRemote('cat ~/.openclaw/current_model 2>/dev/null || echo ""', { quiet: true }).catch(() => '');
+    if (currentModel.trim()) model = currentModel.trim();
+  }
 
   await executeRemote(
-    `mkdir -p ~/.openclaw; ` +
-      `cp -f ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.bak.$(date +%s) || true; ` +
-      `cat > ~/.openclaw/openclaw.json << 'EOF'
-{
-  "agents": {
-    "defaults": {
-      "workspace": "${workspace}",
-      "sandbox": {
-        "mode": "non-main"
-      },
-      "model": {
-        "primary": "ollama/${family}",
-        "fallbacks": []
-      }
-    }
-  },
-  "gateway": {
-    "mode": "local",
-    "bind": "loopback"
-  }
-}
-EOF`,
+    `mkdir -p /root/.openclaw; ` +
+      `cat > /tmp/openclaw_fix_config.py << 'PYEOF'
+import json
+import os
+
+p = '/root/.openclaw/openclaw.json'
+
+data = {}
+if os.path.exists(p):
+    try:
+        with open(p, 'r') as f:
+            raw = f.read().strip()
+        if raw:
+            data = json.loads(raw)
+    except Exception:
+        data = {}
+
+orig = json.dumps(data, sort_keys=True)
+
+agents = data.setdefault('agents', {})
+defaults = agents.setdefault('defaults', {})
+
+defaults['workspace'] = ${JSON.stringify(workspace)}
+
+sandbox = defaults.setdefault('sandbox', {})
+sandbox['mode'] = 'non-main'
+
+model_cfg = defaults.setdefault('model', {})
+model_cfg['primary'] = 'ollama/${model}'
+fallbacks = model_cfg.get('fallbacks')
+if not isinstance(fallbacks, list):
+    model_cfg['fallbacks'] = []
+
+gateway = data.setdefault('gateway', {})
+gateway['mode'] = 'local'
+gateway['bind'] = 'loopback'
+
+models = data.setdefault('models', {})
+providers = models.setdefault('providers', {})
+ollama = providers.setdefault('ollama', {})
+ollama['baseUrl'] = 'http://127.0.0.1:11434'
+ollama['apiKey'] = ollama.get('apiKey') or 'local'
+if not isinstance(ollama.get('models'), list):
+    ollama['models'] = []
+
+new = json.dumps(data, sort_keys=True)
+if new != orig:
+    with open(p, 'w') as f:
+        json.dump(data, f, indent=2)
+PYEOF
+python3 /tmp/openclaw_fix_config.py`,
     { quiet: true }
-  );
+  ).catch(() => null);
+
+  const modelStatus = await executeRemote('openclaw models status --plain 2>/dev/null || true', { quiet: true }).catch(() => '');
+  const wanted = `ollama/${model}`;
+  const alreadyDefault = modelStatus.includes(wanted) && (modelStatus.includes('Default') || modelStatus.includes('Default model'));
+  if (!alreadyDefault) {
+    await executeRemote(`openclaw models set ${wanted} 2>/dev/null || true`, { quiet: true }).catch(() => null);
+  }
+
+  await executeRemote(
+    `mkdir -p /root/.openclaw/agents/main/agent; ` +
+      `cat > /tmp/openclaw_fix_auth.py << 'PYEOF'
+import json
+import os
+
+p = '/root/.openclaw/agents/main/agent/auth-profiles.json'
+
+data = {}
+if os.path.exists(p):
+    try:
+        with open(p, 'r') as f:
+            raw = f.read().strip()
+        if raw:
+            data = json.loads(raw)
+    except Exception:
+        data = {}
+
+data['ollama:local'] = {'type': 'token', 'provider': 'ollama', 'token': 'not-required'}
+lg = data.get('lastGood')
+if not isinstance(lg, dict):
+    lg = {}
+lg['ollama'] = 'ollama:local'
+data['lastGood'] = lg
+
+with open(p, 'w') as f:
+    json.dump(data, f, indent=2)
+PYEOF
+python3 /tmp/openclaw_fix_auth.py; chmod 600 /root/.openclaw/agents/main/agent/auth-profiles.json`,
+    { quiet: true }
+  ).catch(() => null);
 }
 
 async function ensureGatewayToken() {
   const existing = (process.env.OPENCLAW_GATEWAY_TOKEN || '').trim();
   if (existing) return existing;
 
+  const tokenPath = '/root/.openclaw/gateway_token';
   const remote = await executeRemote(
-    'mkdir -p ~/.openclaw; ' +
-      'TOKEN_FILE=~/.openclaw/gateway_token; ' +
-      'if [ -f "$TOKEN_FILE" ] && [ -s "$TOKEN_FILE" ]; then cat "$TOKEN_FILE"; ' +
-      'else python3 - << "PY"\nimport secrets\nprint(secrets.token_hex(32))\nPY ' +
-      '> "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"; cat "$TOKEN_FILE"; fi',
+    `mkdir -p /root/.openclaw; ` +
+      `if [ -f "${tokenPath}" ] && [ -s "${tokenPath}" ]; then cat "${tokenPath}"; ` +
+      `else python3 -c "import secrets; print(secrets.token_hex(32))" > "${tokenPath}"; ` +
+      `chmod 600 "${tokenPath}"; cat "${tokenPath}"; fi`,
     { quiet: true }
   );
 
@@ -441,9 +520,10 @@ async function ensureGatewayToken() {
 
 async function startGateway() {
   const port = process.env.OPENCLAW_GATEWAY_PORT || '18789';
-  const runDir = '~/.openclaw/run';
-  const logPath = `${runDir}/gateway.log`;
-  const pidPath = `${runDir}/gateway.pid`;
+  const runDir = '/root/.openclaw/run';
+  const logPath = '/root/.openclaw/run/gateway.log';
+  const pidPath = '/root/.openclaw/run/gateway.pid';
+  const tokenPath = '/root/.openclaw/gateway_token';
 
   const openclawPath = await executeRemote('command -v openclaw 2>/dev/null || true', { quiet: true }).catch(() => '');
   if (!openclawPath.trim()) {
@@ -458,24 +538,47 @@ async function startGateway() {
 
   await ensureOpenclawConfig();
   const token = await ensureGatewayToken();
-  
-  await executeRemote(
-    `bash -lc '` +
-      `mkdir -p ${runDir}; ` +
-      `pkill -9 -f "openclaw gateway" || true; ` +
-      `rm -f ${logPath} ${pidPath}; ` +
-      `touch ${logPath} ${pidPath}; ` +
-      `chmod 600 ${logPath} ${pidPath} || true; ` +
-      `export OPENCLAW_GATEWAY_TOKEN="${token}"; ` +
-      `nohup openclaw gateway run --bind loopback --port ${port} --force --allow-unconfigured --auth token --verbose ` +
-      `> ${logPath} 2>&1 < /dev/null & ` +
-      `echo $! > ${pidPath}; ` +
-      `sleep 1; ` +
-      `cat ${pidPath} 2>/dev/null || true; ` +
-      `ps -p $(cat ${pidPath} 2>/dev/null) -o pid= -o comm= 2>/dev/null || true; ` +
-      `ls -la ${runDir} || true'`,
-    { quiet: true }
-  );
+
+  // Ensure Ollama is up before starting gateway. Some OpenClaw flows will hang if the backend is unreachable.
+  const ollamaRunning = await executeRemote('pgrep -x ollama >/dev/null 2>&1 && echo yes || echo no', { quiet: true }).catch(() => 'no');
+  if (ollamaRunning.trim() !== 'yes') {
+    await executeRemote('nohup ollama serve > /tmp/ollama.log 2>&1 &', { quiet: true }).catch(() => null);
+    await sleep(1500);
+  }
+
+  await executeRemote(`mkdir -p ${runDir}`, { quiet: true });
+
+  // Stop any supervised gateway service and kill any stray gateway processes.
+  // Note: OpenClaw may run as "openclaw-gateway" (not matching "openclaw gateway"), so we kill both patterns.
+  await executeRemote('openclaw gateway stop 2>/dev/null || true', { quiet: true }).catch(() => null);
+  await executeRemote('pkill -9 -f "openclaw-gateway" || true', { quiet: true }).catch(() => null);
+  await executeRemote('pkill -9 -f "openclaw gateway" || true', { quiet: true }).catch(() => null);
+
+  // If a supervised process respawns or the name does not match, kill whatever is actually bound to the port.
+  const portKillCmd =
+    `pids=$(ss -ltnp 2>/dev/null | grep :${port} | sed -n 's/.*pid=\\([0-9]\\+\\).*/\\1/p' | head -n 10 | tr '\n' ' '); ` +
+    `if [ -n "$pids" ]; then kill -9 $pids 2>/dev/null || true; fi`;
+  await executeRemote(portKillCmd, { quiet: true }).catch(() => null);
+
+  // Wait for port to be free before starting.
+  for (let i = 0; i < 10; i += 1) {
+    const ssCheck = await executeRemote(`ss -ltnp 2>/dev/null | grep :${port} || true`, { quiet: true }).catch(() => '');
+    const nsCheck = await executeRemote(`netstat -lntp 2>/dev/null | grep :${port} || true`, { quiet: true }).catch(() => '');
+    const inUse = `${ssCheck}\n${nsCheck}`.includes(`:${port}`) || `${ssCheck}\n${nsCheck}`.includes(` ${port} `);
+    if (!inUse) break;
+    await sleep(500);
+  }
+
+  await executeRemote(`rm -f ${logPath} ${pidPath}`, { quiet: true });
+  await executeRemote(`touch ${logPath} ${pidPath} && chmod 600 ${logPath} ${pidPath}`, { quiet: true });
+
+  const startCmd =
+    `OPENCLAW_GATEWAY_TOKEN=$(cat ${tokenPath}) ` +
+    `nohup openclaw gateway run --bind loopback --port ${port} --force --allow-unconfigured --auth token --verbose ` +
+    `> ${logPath} 2>&1 & echo $! > ${pidPath}`;
+
+  const startOut = await executeRemote(`bash -lc '${startCmd}; sleep 1; cat ${pidPath}; ls -la ${runDir}'`, { quiet: true }).catch(e => `start error: ${e.message}`);
+  if (process.env.VERBOSE) console.log('  [gateway start output]', startOut);
 
   const startupTimeoutMs = parseInt(process.env.OPENCLAW_GATEWAY_START_TIMEOUT_MS || '30000');
   const start = Date.now();
@@ -601,23 +704,17 @@ export async function executeRemote(command, options = {}) {
   }
 }
 
-export async function getConnectionStatus() {
+export function getConnectionStatus() {
   const config = getConfig();
   
   if (!config.host) {
     return { connected: false, host: null };
   }
   
-  if (sshConnection) {
-    return { connected: true, host: config.host };
-  }
-  
-  try {
-    await connect({ force: false, verbose: false });
-    return { connected: true, host: config.host };
-  } catch {
-    return { connected: false, host: config.host };
-  }
+  return { 
+    connected: sshConnection !== null, 
+    host: config.host 
+  };
 }
 
 export function disconnect() {

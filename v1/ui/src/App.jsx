@@ -16,7 +16,9 @@ import {
   AlertTriangle,
   Terminal,
   FolderSync,
-  Bot
+  Bot,
+  ExternalLink,
+  Copy
 } from 'lucide-react'
 
 const API_BASE = '/api'
@@ -37,8 +39,28 @@ function useApi() {
     if (res.status === 401) {
       throw new Error('Unauthorized - check your auth token')
     }
-    
-    return res.json()
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase()
+    const raw = await res.text()
+    const hasBody = raw && raw.trim().length > 0
+
+    let data = null
+    if (hasBody && contentType.includes('application/json')) {
+      try {
+        data = JSON.parse(raw)
+      } catch {
+        throw new Error('Server returned invalid JSON')
+      }
+    } else if (hasBody) {
+      data = { message: raw }
+    }
+
+    if (!res.ok) {
+      const msg = (data && (data.error || data.message)) ? (data.error || data.message) : `Request failed (${res.status})`
+      throw new Error(msg)
+    }
+
+    return data
   }
   
   return { fetchApi, token, setToken: (t) => { setToken(t); localStorage.setItem('authToken', t) } }
@@ -72,6 +94,7 @@ function App() {
   const [loading, setLoading] = useState({})
   const [error, setError] = useState(null)
   const [activeTab, setActiveTab] = useState('dashboard')
+  const [dashboardInfo, setDashboardInfo] = useState(null)
   
   const fetchStatus = async () => {
     try {
@@ -146,13 +169,30 @@ function App() {
     }
   }
   
+  const openWebUI = async () => {
+    setLoading(prev => ({ ...prev, webui: true }))
+    try {
+      const data = await fetchApi('/openclaw/webui', { method: 'POST' })
+      setDashboardInfo(data)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setLoading(prev => ({ ...prev, webui: false }))
+    }
+  }
+  
+  const copyToClipboard = (text) => {
+    navigator.clipboard.writeText(text)
+  }
+  
   if (!token) {
     return (
       <div className="min-h-screen flex items-center justify-center p-8">
         <div className="card max-w-md w-full">
           <div className="text-center mb-6">
             <span className="text-6xl">🦞</span>
-            <h1 className="text-2xl font-bold mt-4">Moltbook + OpenClaw v1</h1>
+            <h1 className="text-2xl font-bold mt-4">MattyJacksBot Self Improving AI System</h1>
+            <p className="text-gray-400 mt-1">MJBSIAIS</p>
             <p className="text-gray-400 mt-2">Enter your auth token to continue</p>
           </div>
           
@@ -188,8 +228,8 @@ function App() {
           <div className="flex items-center gap-3">
             <span className="text-3xl">🦞</span>
             <div>
-              <h1 className="font-bold text-xl">Moltbook + OpenClaw</h1>
-              <p className="text-sm text-gray-400">v1 Control Panel</p>
+              <h1 className="font-bold text-xl">MattyJacksBot Self Improving AI System</h1>
+              <p className="text-sm text-gray-400">MJBSIAIS Control Panel</p>
             </div>
           </div>
           
@@ -312,6 +352,62 @@ function App() {
                   Stop
                 </button>
               </div>
+              <button 
+                onClick={openWebUI}
+                disabled={loading.webui || !status?.connection?.connected}
+                className="btn btn-secondary w-full mt-2 flex items-center justify-center gap-2"
+              >
+                <ExternalLink className="w-4 h-4" />
+                {loading.webui ? 'Checking...' : 'Open Web UI'}
+              </button>
+              {dashboardInfo && (
+                <div className="mt-3 p-3 bg-gray-800 rounded-lg text-xs">
+                  <p className={dashboardInfo.success ? 'text-emerald-400' : 'text-yellow-400'}>
+                    {dashboardInfo.message}
+                  </p>
+                  {dashboardInfo.tunnelCommand && (
+                    <div className="mt-2">
+                      <p className="text-gray-400 mb-1">1. Run this SSH tunnel in a terminal:</p>
+                      <div className="flex items-center gap-2">
+                        <code className="bg-gray-900 px-2 py-1 rounded flex-1 overflow-x-auto text-xs">
+                          {dashboardInfo.tunnelCommand}
+                        </code>
+                        <button 
+                          onClick={() => copyToClipboard(dashboardInfo.tunnelCommand)}
+                          className="p-1 hover:bg-gray-700 rounded"
+                          title="Copy"
+                        >
+                          <Copy className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {dashboardInfo.webUrl && (
+                    <div className="mt-2">
+                      <p className="text-gray-400 mb-1">2. Then open (includes auth token):</p>
+                      <div className="flex items-center gap-2">
+                        <code className="bg-gray-900 px-2 py-1 rounded flex-1 overflow-x-auto text-xs text-emerald-400 break-all">
+                          {dashboardInfo.webUrl}
+                        </code>
+                        <button 
+                          onClick={() => copyToClipboard(dashboardInfo.webUrl)}
+                          className="p-1 hover:bg-gray-700 rounded"
+                          title="Copy URL"
+                        >
+                          <Copy className="w-4 h-4" />
+                        </button>
+                        <button 
+                          onClick={() => window.open(dashboardInfo.webUrl, '_blank')}
+                          className="p-1 hover:bg-gray-700 rounded"
+                          title="Open"
+                        >
+                          <ExternalLink className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
             </StatusCard>
             
             <StatusCard 

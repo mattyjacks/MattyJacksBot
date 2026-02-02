@@ -11,6 +11,7 @@
     "dev": "concurrently \"npm run dev:server\" \"npm run dev:ui\"",
     "dev:server": "node --watch controller/server.js",
     "dev:ui": "cd ui && npm run dev",
+    "ui": "cd ui && npm run dev",
     "build": "cd ui && npm run build",
     "start": "node controller/server.js",
     "cli": "node controller/cli.js"

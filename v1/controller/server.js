@@ -180,10 +180,54 @@ app.get('/api/logs', async (req, res) => {
   try {
     const lines = parseInt(req.query.lines || '100');
     const logs = await executeRemote(
-      `tail -n ${lines} /tmp/openclaw-gateway.log 2>/dev/null || echo "No logs"`,
+      `tail -n ${lines} /root/.openclaw/run/gateway.log 2>/dev/null || echo "No logs"`,
       { quiet: true }
     );
     res.json({ logs });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/openclaw/webui', async (req, res) => {
+  try {
+    const gatewayPort = process.env.OPENCLAW_GATEWAY_PORT || '18789';
+    const tunnelCmd = `ssh -N -L ${gatewayPort}:127.0.0.1:${gatewayPort} -p ${process.env.VAST_PORT} ${process.env.VAST_USER}@${process.env.VAST_HOST} -i ${process.env.VAST_SSH_KEY_PATH}`;
+    
+    const { connected } = getConnectionStatus();
+    
+    if (!connected) {
+      return res.json({ 
+        success: false,
+        port: gatewayPort,
+        message: 'Not connected to Vast instance. Click Connect first.',
+        tunnelCommand: tunnelCmd,
+        webUrl: `http://localhost:${gatewayPort}/`
+      });
+    }
+    
+    let isRunning = false;
+    let token = null;
+    try {
+      const check = await executeRemote(`ss -ltnp | grep :${gatewayPort} || true`, { quiet: true });
+      isRunning = check.includes(`:${gatewayPort}`);
+      token = (await executeRemote(`cat /root/.openclaw/gateway_token 2>/dev/null || true`, { quiet: true })).trim();
+    } catch {
+      // Connection may have dropped, return safe fallback
+    }
+    
+    const tokenizedUrl = token ? `http://localhost:${gatewayPort}/?token=${token}` : `http://localhost:${gatewayPort}/`;
+    
+    res.json({ 
+      success: isRunning,
+      port: gatewayPort,
+      message: isRunning 
+        ? `Gateway running! Set up tunnel, then open the tokenized URL below.`
+        : 'Gateway may not be running. Try clicking Connect.',
+      tunnelCommand: tunnelCmd,
+      webUrl: tokenizedUrl,
+      token: token || null
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

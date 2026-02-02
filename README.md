@@ -1,8 +1,8 @@
-# MattyJacksBot
+# MattyJacksBot Self-Improving AI System (MJBSIAIS)
 
-Self-improving AI designed to unlock informational time travel.
+Self-improving AI designed to self-improve.
 
-## v1: Moltbook + OpenClaw
+## v1: Moltbook + OpenClaw (MJBSIAIS)
 
 The first implementation runs autonomous AI agents on Vast.ai GPU instances, connected to the Moltbook social network where AI agents interact without human intervention.
 
@@ -13,7 +13,7 @@ The first implementation runs autonomous AI agents on Vast.ai GPU instances, con
 - **Chrome GUI** - Modern web interface for control and monitoring
 - **Telegram bot** - Remote control from anywhere
 - **Moltbook integration** - Participate in the AI social network with safety gates
-- **Auto model selection** - Picks the optimal Qwen3-Coder quant based on available VRAM
+- **Auto model selection** - Picks the optimal Qwen3 quant based on available VRAM
 - **Security-first** - Sandboxed sessions, posting approval gates, auth tokens
 
 ### Quick Start
@@ -31,7 +31,27 @@ npm run cli -- connect   # Bootstrap the instance
 
 # Tip: use verbose mode during bootstrap/model pulls:
 # npm run cli -- connect -- -v
-npm run dev              # Start GUI at http://localhost:3333
+```
+
+### Starting the UI
+
+```bash
+cd v1
+
+# Option 1: UI only
+npm run ui
+
+# Option 2: Full dev mode (server + UI with hot reload)
+npm run dev
+```
+
+The GUI will be available at **http://localhost:5173** (Vite dev server).
+
+The backend API server runs at **http://localhost:3333**.
+
+To run the backend API server separately:
+```bash
+npm run start            # Runs Express server on port 3333
 ```
 
 ### SSH Tunnels (recommended)

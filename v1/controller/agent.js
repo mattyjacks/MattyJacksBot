@@ -1,15 +1,33 @@
-import { executeRemote } from './ssh.js';
+import { executeRemote, getConnectionStatus } from './ssh.js';
 
 let cachedStatus = null;
+let lastStatusCheck = 0;
+const STATUS_CACHE_MS = 5000;
 
 export async function getAgentStatus() {
+  const { connected } = getConnectionStatus();
+  
+  if (!connected) {
+    return cachedStatus || {
+      running: false,
+      model: null,
+      vram: null,
+      moltbookMode: process.env.MOLTBOOK_MODE || 'readonly',
+      error: 'Not connected'
+    };
+  }
+  
+  if (cachedStatus && (Date.now() - lastStatusCheck) < STATUS_CACHE_MS) {
+    return cachedStatus;
+  }
+  
   try {
     const gatewayCheck = await executeRemote(
-      'pgrep -f "openclaw gateway" > /dev/null && echo "running" || echo "stopped"',
+      'pgrep -f "openclaw-gateway" >/dev/null 2>&1 || pgrep -f "openclaw gateway" >/dev/null 2>&1; echo $?',
       { quiet: true }
     );
     
-    const running = gatewayCheck.trim() === 'running';
+    const running = gatewayCheck.trim() === '0';
     
     let model = null;
     try {
@@ -34,10 +52,11 @@ export async function getAgentStatus() {
       moltbookMode,
       lastCheck: new Date().toISOString()
     };
+    lastStatusCheck = Date.now();
     
     return cachedStatus;
   } catch (error) {
-    return {
+    return cachedStatus || {
       running: false,
       model: null,
       vram: null,
@@ -49,32 +68,53 @@ export async function getAgentStatus() {
 
 export async function startAgent() {
   const port = process.env.OPENCLAW_GATEWAY_PORT || '18789';
+  const tokenPath = '/root/.openclaw/gateway_token';
+  const logPath = '/root/.openclaw/run/gateway.log';
+
+  // If gateway already up on the port, treat Start as success (avoid lock timeout spam)
+  const alreadyListening = await executeRemote(
+    `ss -ltnp 2>/dev/null | grep :${port} || true`,
+    { quiet: true }
+  ).catch(() => '');
+  if (alreadyListening.includes(`:${port}`)) {
+    return { started: true, alreadyRunning: true };
+  }
+
+  // Ensure Ollama is running
+  const ollamaRunning = await executeRemote('pgrep -x ollama >/dev/null 2>&1 && echo yes || echo no', { quiet: true }).catch(() => 'no');
+  if (ollamaRunning.trim() !== 'yes') {
+    await executeRemote('nohup ollama serve > /tmp/ollama.log 2>&1 &', { quiet: true }).catch(() => null);
+    await new Promise(resolve => setTimeout(resolve, 1500));
+  }
   
-  await executeRemote('pkill ollama || true', { quiet: true });
-  await executeRemote('nohup ollama serve > /tmp/ollama.log 2>&1 &', { quiet: true });
-  
-  await new Promise(resolve => setTimeout(resolve, 2000));
+  await executeRemote(`mkdir -p /root/.openclaw/run`, { quiet: true });
+  await executeRemote('openclaw gateway stop 2>/dev/null || true', { quiet: true }).catch(() => null);
+  await executeRemote(`pkill -9 -f "openclaw-gateway" || true`, { quiet: true }).catch(() => null);
+  await executeRemote(`pkill -9 -f "openclaw gateway" || true`, { quiet: true }).catch(() => null);
   
   await executeRemote(
-    `pkill -9 -f "openclaw gateway" || true; ` +
-    `nohup openclaw gateway run --bind loopback --port ${port} --force > /tmp/openclaw-gateway.log 2>&1 &`,
+    `OPENCLAW_GATEWAY_TOKEN=$(cat ${tokenPath} 2>/dev/null || echo "") ` +
+    `nohup openclaw gateway run --bind loopback --port ${port} --force --allow-unconfigured --auth token --verbose ` +
+    `> ${logPath} 2>&1 &`,
     { quiet: true }
   );
   
   await new Promise(resolve => setTimeout(resolve, 3000));
   
-  const check = await executeRemote(`pgrep -f "openclaw gateway"`, { quiet: true }).catch(() => '');
+  const check = await executeRemote(`pgrep -f "openclaw-gateway" || pgrep -f "openclaw gateway" || true`, { quiet: true }).catch(() => '');
   
   if (!check.trim()) {
-    throw new Error('Agent failed to start. Check logs with: v1 logs');
+    const logs = await executeRemote(`tail -20 ${logPath} 2>/dev/null || echo "No logs"`, { quiet: true }).catch(() => 'Could not read logs');
+    throw new Error(`Agent failed to start. Logs:\n${logs}`);
   }
   
   return { started: true };
 }
 
 export async function stopAgent() {
-  await executeRemote('pkill -9 -f "openclaw gateway" || true', { quiet: true });
-  await executeRemote('pkill ollama || true', { quiet: true });
+  await executeRemote('openclaw gateway stop 2>/dev/null || true', { quiet: true }).catch(() => null);
+  await executeRemote('pkill -9 -f "openclaw-gateway" || true', { quiet: true }).catch(() => null);
+  await executeRemote('pkill -9 -f "openclaw gateway" || true', { quiet: true }).catch(() => null);
   
   return { stopped: true };
 }
