@@ -1,0 +1,36 @@
+{
+  "name": "moltbook-openclaw-v1",
+  "version": "1.0.0",
+  "description": "Self-improving AI control system for OpenClaw + Moltbook on Vast.ai",
+  "type": "module",
+  "main": "controller/index.js",
+  "bin": {
+    "v1": "./controller/cli.js"
+  },
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:ui\"",
+    "dev:server": "node --watch controller/server.js",
+    "dev:ui": "cd ui && npm run dev",
+    "build": "cd ui && npm run build",
+    "start": "node controller/server.js",
+    "cli": "node controller/cli.js"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "ssh2": "^1.15.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "author": "Matt",
+  "license": "MIT"
+}

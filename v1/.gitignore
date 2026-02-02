@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+ui/node_modules/
+
+# Environment (contains secrets)
+.env
+.env.local
+.env.*.local
+
+# Sync state and backups
+sync/state/
+sync/.sync_backups/
+*.sync-conflict-*
+
+# Build output
+ui/dist/
+dist/
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Runtime
+*.pid
+.cache/
