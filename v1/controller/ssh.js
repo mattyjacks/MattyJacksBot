@@ -46,6 +46,58 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function formatProgressBar(percent, width = 28) {
+  const p = Math.max(0, Math.min(100, percent));
+  const filled = Math.round((p / 100) * width);
+  const empty = Math.max(0, width - filled);
+  return `[${'='.repeat(filled)}${' '.repeat(empty)}]`;
+}
+
+function parseOllamaPullProgress(text) {
+  const lines = (text || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    const pm = line.match(/(\d{1,3})%/);
+    if (!pm) continue;
+
+    const percent = parseInt(pm[1], 10);
+    const bytes = (line.match(/([\d.]+\s*[KMG]B)\s*\/\s*([\d.]+\s*[KMG]B)/i) || []).slice(1);
+    const transferred = bytes[0] || '';
+    const total = bytes[1] || '';
+    const sm = line.match(/([\d.]+\s*[KMG]B\/s)/i);
+    const speed = sm ? sm[1] : '';
+    const em = line.match(/\s(\d+[smhd]\d*[smhd]?)\s*$/i);
+    const eta = em ? em[1] : '';
+
+    return { percent, transferred, total, speed, eta, raw: line };
+  }
+  return null;
+}
+
+function renderPullProgress(model, progress) {
+  if (!progress) {
+    process.stdout.write(`\r  Pulling ${model} ...`);
+    return;
+  }
+  const bar = formatProgressBar(progress.percent);
+  const parts = [
+    `Pulling ${model}`,
+    bar,
+    `${progress.percent}%`
+  ];
+  if (progress.transferred && progress.total) {
+    parts.push(`${progress.transferred}/${progress.total}`);
+  }
+  if (progress.speed) {
+    parts.push(progress.speed);
+  }
+  if (progress.eta) {
+    parts.push(progress.eta);
+  }
+  const line = `  ${parts.join('  ')}`;
+  process.stdout.write(`\r${line}`);
+}
+
 async function connectOnce(config, options = {}) {
   return new Promise((resolve, reject) => {
     const conn = new Client();
@@ -246,10 +298,28 @@ async function isModelPresent(model) {
 
 async function waitForModel(model, timeoutMs) {
   const start = Date.now();
+  let lastProgressKey = '';
+  let lastPresenceCheck = 0;
   while (Date.now() - start < timeoutMs) {
-    const present = await isModelPresent(model);
-    if (present) return;
-    await sleep(20000);
+    const tail = await executeRemote('tail -n 20 /tmp/ollama-pull.log 2>/dev/null || true', { quiet: true });
+    const progress = parseOllamaPullProgress(tail);
+    const key = progress ? `${progress.percent}-${progress.transferred}-${progress.total}-${progress.speed}-${progress.eta}` : 'none';
+    if (key !== lastProgressKey) {
+      renderPullProgress(model, progress);
+      lastProgressKey = key;
+    }
+
+    const now = Date.now();
+    if (now - lastPresenceCheck > 20000) {
+      const present = await isModelPresent(model);
+      if (present) {
+        process.stdout.write('\n');
+        return;
+      }
+      lastPresenceCheck = now;
+    }
+
+    await sleep(2000);
   }
   const tail = await executeRemote('tail -n 50 /tmp/ollama-pull.log 2>/dev/null || true', { quiet: true });
   throw new Error(`Timed out waiting for model pull: ${model}. Tail of /tmp/ollama-pull.log:\n${tail}`);
@@ -308,24 +378,159 @@ async function ensureGatewayRunning() {
   }
 }
 
-async function startGateway() {
-  const port = process.env.OPENCLAW_GATEWAY_PORT || '18789';
-  
+function modelFamilyName() {
+  const family = (process.env.MODEL_FAMILY || 'qwen3').trim();
+  return family.split(':')[0];
+}
+
+async function ensureOpenclawConfig() {
+  const workspace = process.env.OPENCLAW_WORKSPACE || '~/moltbook/v1/agent_runtime/workspace';
+  const family = modelFamilyName();
+
+  const hasLegacy = await executeRemote(
+    'test -f ~/.openclaw/openclaw.json && grep -q ' +
+      '"agent"' +
+      ' ~/.openclaw/openclaw.json && echo yes || echo no',
+    { quiet: true }
+  ).catch(() => 'no');
+
+  if (hasLegacy.trim() !== 'yes') return;
+
   await executeRemote(
-    `pkill -9 -f "openclaw gateway" || true; ` +
-    `nohup openclaw gateway run --bind loopback --port ${port} --force > /tmp/openclaw-gateway.log 2>&1 &`,
+    `mkdir -p ~/.openclaw; ` +
+      `cp -f ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.bak.$(date +%s) || true; ` +
+      `cat > ~/.openclaw/openclaw.json << 'EOF'
+{
+  "agents": {
+    "defaults": {
+      "workspace": "${workspace}",
+      "sandbox": {
+        "mode": "non-main"
+      },
+      "model": {
+        "primary": "ollama/${family}",
+        "fallbacks": []
+      }
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "bind": "loopback"
+  }
+}
+EOF`,
     { quiet: true }
   );
-  
-  await new Promise(resolve => setTimeout(resolve, 2000));
-  
-  const check = await executeRemote(`ss -ltnp | grep ${port}`, { quiet: true }).catch(() => '');
-  
-  if (!check.includes(port)) {
-    throw new Error('Gateway failed to start');
+}
+
+async function ensureGatewayToken() {
+  const existing = (process.env.OPENCLAW_GATEWAY_TOKEN || '').trim();
+  if (existing) return existing;
+
+  const remote = await executeRemote(
+    'mkdir -p ~/.openclaw; ' +
+      'TOKEN_FILE=~/.openclaw/gateway_token; ' +
+      'if [ -f "$TOKEN_FILE" ] && [ -s "$TOKEN_FILE" ]; then cat "$TOKEN_FILE"; ' +
+      'else python3 - << "PY"\nimport secrets\nprint(secrets.token_hex(32))\nPY ' +
+      '> "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"; cat "$TOKEN_FILE"; fi',
+    { quiet: true }
+  );
+
+  return remote.trim();
+}
+
+async function startGateway() {
+  const port = process.env.OPENCLAW_GATEWAY_PORT || '18789';
+  const runDir = '~/.openclaw/run';
+  const logPath = `${runDir}/gateway.log`;
+  const pidPath = `${runDir}/gateway.pid`;
+
+  const openclawPath = await executeRemote('command -v openclaw 2>/dev/null || true', { quiet: true }).catch(() => '');
+  if (!openclawPath.trim()) {
+    throw new Error('OpenClaw not found on remote (command -v openclaw returned empty). Re-run connect with --force or install openclaw on the instance.');
   }
+
+  await executeRemote(
+    'command -v ss >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq iproute2); ' +
+    'command -v netstat >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq net-tools)',
+    { quiet: true }
+  ).catch(() => null);
+
+  await ensureOpenclawConfig();
+  const token = await ensureGatewayToken();
   
-  console.log(`  Gateway running on port ${port}`);
+  await executeRemote(
+    `bash -lc '` +
+      `mkdir -p ${runDir}; ` +
+      `pkill -9 -f "openclaw gateway" || true; ` +
+      `rm -f ${logPath} ${pidPath}; ` +
+      `touch ${logPath} ${pidPath}; ` +
+      `chmod 600 ${logPath} ${pidPath} || true; ` +
+      `export OPENCLAW_GATEWAY_TOKEN="${token}"; ` +
+      `nohup openclaw gateway run --bind loopback --port ${port} --force --allow-unconfigured --auth token --verbose ` +
+      `> ${logPath} 2>&1 < /dev/null & ` +
+      `echo $! > ${pidPath}; ` +
+      `sleep 1; ` +
+      `cat ${pidPath} 2>/dev/null || true; ` +
+      `ps -p $(cat ${pidPath} 2>/dev/null) -o pid= -o comm= 2>/dev/null || true; ` +
+      `ls -la ${runDir} || true'`,
+    { quiet: true }
+  );
+
+  const startupTimeoutMs = parseInt(process.env.OPENCLAW_GATEWAY_START_TIMEOUT_MS || '30000');
+  const start = Date.now();
+  let lastCheck = '';
+  let pid = '';
+
+  pid = await executeRemote(`cat ${pidPath} 2>/dev/null || true`, { quiet: true }).catch(() => '');
+
+  while (Date.now() - start < startupTimeoutMs) {
+    const ssCheck = await executeRemote(`ss -ltnp 2>/dev/null | grep :${port} || true`, { quiet: true }).catch(() => '');
+    const nsCheck = await executeRemote(`netstat -lntp 2>/dev/null | grep :${port} || true`, { quiet: true }).catch(() => '');
+    const check = `${ssCheck}\n${nsCheck}`.trim();
+    lastCheck = check;
+
+    if (check.includes(`:${port}`) || check.includes(` ${port} `) || check.includes(port)) {
+      console.log(`  Gateway running on port ${port}`);
+      return;
+    }
+
+    if (pid.trim()) {
+      const pidAliveCheck = await executeRemote(`ps -p ${pid.trim()} -o pid= -o comm= 2>/dev/null || true`, { quiet: true }).catch(() => '');
+      if (!pidAliveCheck.trim()) {
+        break;
+      }
+    } else {
+      const running = await executeRemote('pgrep -f "openclaw gateway" || true', { quiet: true }).catch(() => '');
+      if (!running.trim()) {
+        break;
+      }
+    }
+
+    await sleep(1000);
+  }
+
+  const pidAlive = pid.trim()
+    ? await executeRemote(`ps -p ${pid.trim()} -o pid= -o comm= 2>/dev/null || true`, { quiet: true }).catch(() => '')
+    : '';
+
+  const list = await executeRemote(`ls -la ${runDir} 2>/dev/null || true`, { quiet: true }).catch(() => '');
+  const logStat = await executeRemote(`ls -la ${logPath} 2>/dev/null || true`, { quiet: true }).catch(() => '');
+  const tail = await executeRemote(`tail -n 200 ${logPath} 2>/dev/null || true`, { quiet: true }).catch(() => '');
+  const version = await executeRemote('openclaw --version 2>&1 || true', { quiet: true }).catch(() => '');
+  const gatewayHelp = await executeRemote('openclaw gateway --help 2>&1 || true', { quiet: true }).catch(() => '');
+
+  throw new Error(
+    `Gateway failed to start. ` +
+    `PID: ${pid.trim() || 'unknown'}\n` +
+    `PID alive: ${pidAlive.trim() || 'no'}\n\n` +
+    `Port check output:\n${lastCheck}\n\n` +
+    `Files:\n${list}\n\n` +
+    `Log stat:\n${logStat}\n\n` +
+    `Tail of gateway log:\n${tail}`
+    + `\n\nOpenClaw version:\n${version}`
+    + `\n\nOpenClaw gateway help:\n${gatewayHelp}`
+  );
 }
 
 async function setupWorkspace() {

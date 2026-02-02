@@ -28,6 +28,9 @@ copy .env.example .env
 npm run cli -- connect   # Bootstrap the instance
 # Note: first-time bootstrap can take a while and may require running this command twice.
 # The first run can still be doing installs on the instance even if it looks like it stopped.
+
+# Tip: use verbose mode during bootstrap/model pulls:
+# npm run cli -- connect -- -v
 npm run dev              # Start GUI at http://localhost:3333
 ```
 
