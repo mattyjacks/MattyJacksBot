@@ -18,6 +18,21 @@ NOTE THAT WE'RE WAITING ON MORE SOLID USER MANAGEMENT FEATURES BEFORE WE ACTUALL
 - **Auto model selection** - Picks the optimal Qwen3 quant based on available VRAM
 - **Security-first** - Sandboxed sessions, posting approval gates, auth tokens
 
+### Telegram bot highlights
+
+- **Automatic web context** - Detects URLs in chat and auto-visits, crawls, or searches when relevant. Also handles named sources like Wikipedia (for example: "go to Wikipedia and learn about X").
+- **File writing and updates** - When you explicitly ask to write/save a file, it will create the file in the synced workspace. If the file already exists and you ask to update/overwrite it, it can overwrite the existing file.
+- **Fast "hot-swap" file context** - Injects a small, relevance-ranked set of file snippets into the prompt each message, plus explicit file existence hints for paths you mention (for example `private/workspace/foo.md`).
+- **Automatic long-context pruning** - If the prompt approaches the model context limit, the bot prunes history and context to keep the prompt smaller and responsive.
+- **Repeating messages** - Set a repeating message every minute using `/repeat`.
+
+#### Telegram commands
+
+- **`/visit <url>`** - Visit a web page and summarize
+- **`/crawl <url> [maxPages] [maxDepth]`** - Crawl a website and summarize
+- **`/repeat <message>`** - Repeat a message every minute
+- **`/repeat stop`** - Stop repeating
+
 ### Quick Start
 
 ```bash
