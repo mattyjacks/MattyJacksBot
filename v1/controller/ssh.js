@@ -561,6 +561,8 @@ async function startGateway() {
   const runDir = '/root/.openclaw/run';
   const logPath = '/root/.openclaw/run/gateway.log';
   const pidPath = '/root/.openclaw/run/gateway.pid';
+  const watchdogPath = '/root/.openclaw/run/gateway_watchdog.sh';
+  const watchdogPidPath = '/root/.openclaw/run/gateway_watchdog.pid';
   const tokenPath = '/root/.openclaw/gateway_token';
 
   const openclawPath = await executeRemote('command -v openclaw 2>/dev/null || true', { quiet: true }).catch(() => '');
@@ -592,6 +594,15 @@ async function startGateway() {
   await executeRemote('pkill -9 -f "openclaw-gateway" || true', { quiet: true }).catch(() => null);
   await executeRemote('pkill -9 -f "openclaw gateway" || true', { quiet: true }).catch(() => null);
 
+  await executeRemote(
+    `if [ -f ${watchdogPidPath} ]; then ` +
+      `pid=$(cat ${watchdogPidPath} 2>/dev/null || true); ` +
+      `if [ -n "$pid" ]; then kill -9 $pid 2>/dev/null || true; fi; ` +
+      `rm -f ${watchdogPidPath}; ` +
+      `fi`,
+    { quiet: true }
+  ).catch(() => null);
+
   // If a supervised process respawns or the name does not match, kill whatever is actually bound to the port.
   const portKillCmd =
     `pids=$(ss -ltnp 2>/dev/null | grep :${port} | sed -n 's/.*pid=\\([0-9]\\+\\).*/\\1/p' | head -n 10 | tr '\n' ' '); ` +
@@ -610,12 +621,36 @@ async function startGateway() {
   await executeRemote(`rm -f ${logPath} ${pidPath}`, { quiet: true });
   await executeRemote(`touch ${logPath} ${pidPath} && chmod 600 ${logPath} ${pidPath}`, { quiet: true });
 
-  const startCmd =
-    `OPENCLAW_GATEWAY_TOKEN=$(cat ${tokenPath}) ` +
-    `nohup openclaw gateway run --bind loopback --port ${port} --force --allow-unconfigured --auth token --verbose ` +
-    `> ${logPath} 2>&1 & echo $! > ${pidPath}`;
+  const watchdogScript =
+    `#!/usr/bin/env bash\n` +
+    `set -u\n` +
+    `PORT="${port}"\n` +
+    `TOKEN_PATH="${tokenPath}"\n` +
+    `LOG_PATH="${logPath}"\n` +
+    `PID_PATH="${pidPath}"\n` +
+    `while true; do\n` +
+    `  TOKEN=$(cat "$TOKEN_PATH" 2>/dev/null || echo "")\n` +
+    `  if [ -z "$TOKEN" ]; then\n` +
+    `    sleep 2\n` +
+    `    continue\n` +
+    `  fi\n` +
+    `  OPENCLAW_GATEWAY_TOKEN="$TOKEN" openclaw gateway run --bind loopback --port "$PORT" --force --allow-unconfigured --auth token --verbose >> "$LOG_PATH" 2>&1 &\n` +
+    `  echo $! > "$PID_PATH"\n` +
+    `  wait $(cat "$PID_PATH" 2>/dev/null || echo "")\n` +
+    `  sleep 1\n` +
+    `done\n`;
 
-  const startOut = await executeRemote(`bash -lc '${startCmd}; sleep 1; cat ${pidPath}; ls -la ${runDir}'`, { quiet: true }).catch(e => `start error: ${e.message}`);
+  await executeRemote(
+    `cat > ${watchdogPath} << 'EOF'\n${watchdogScript}EOF\n` +
+      `chmod 700 ${watchdogPath}`,
+    { quiet: true }
+  );
+
+  const startOut = await executeRemote(
+    `nohup ${watchdogPath} > /dev/null 2>&1 & echo $! > ${watchdogPidPath}; ` +
+      `sleep 1; cat ${watchdogPidPath} 2>/dev/null || true; ls -la ${runDir}`,
+    { quiet: true }
+  ).catch(e => `start error: ${e.message}`);
   if (process.env.VERBOSE) console.log('  [gateway start output]', startOut);
 
   const startupTimeoutMs = parseInt(process.env.OPENCLAW_GATEWAY_START_TIMEOUT_MS || '30000');
