@@ -116,6 +116,52 @@ function isBlockedHostname(hostname) {
   return false;
 }
 
+function wantsWikipediaFromUserText(text) {
+  const t = String(text || '').toLowerCase();
+  if (!t) return false;
+  return t.includes('wikipedia') || /\bwiki\b/.test(t);
+}
+
+function extractWikipediaQueryFromUserText(text) {
+  const s = String(text || '').trim();
+  if (!s) return '';
+
+  const m1 = s.match(/wikipedia\s*(?:and\s*)?(?:learn|read|look\s*up|search|find)?\s*(?:about\s*)?(.+)/i);
+  if (m1 && String(m1[1] || '').trim()) return String(m1[1] || '').trim();
+
+  const m2 = s.match(/(?:learn|read|look\s*up|search|find)\s*(?:about\s*)?(.+?)\s*(?:on|in)\s*wikipedia/i);
+  if (m2 && String(m2[1] || '').trim()) return String(m2[1] || '').trim();
+
+  const cleaned = s
+    .replace(/\bgo\b/gi, ' ')
+    .replace(/\bto\b/gi, ' ')
+    .replace(/\bon\b/gi, ' ')
+    .replace(/\bin\b/gi, ' ')
+    .replace(/\bwikipedia\b/gi, ' ')
+    .replace(/\bwiki\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned;
+}
+
+function wikipediaSearchUrl(query) {
+  const q = String(query || '').trim();
+  const use = q || 'Wikipedia';
+  return `https://en.wikipedia.org/w/index.php?search=${encodeURIComponent(use)}`;
+}
+
+function pickTopWikipediaArticleUrl(links) {
+  const list = Array.isArray(links) ? links : [];
+  for (const u of list) {
+    const s = String(u || '').trim();
+    if (!s) continue;
+    if (!s.startsWith('https://en.wikipedia.org/wiki/')) continue;
+    if (s.includes(':')) continue;
+    return s;
+  }
+  return null;
+}
+
 function shouldAutoCrawlFromUserText(text) {
   const t = String(text || '').toLowerCase();
   return (
@@ -227,6 +273,30 @@ async function runWebActions(actions) {
 async function gatherAutoWebContext(userText) {
   const urls = extractUrlsFromText(userText);
   const out = [];
+
+  if (urls.length === 0 && wantsWikipediaFromUserText(userText)) {
+    const q = extractWikipediaQueryFromUserText(userText);
+    const searchUrl = wikipediaSearchUrl(q);
+    try {
+      const fetched = await safeFetchUrl(searchUrl);
+      const text = clampTextChars(stripHtmlToText(fetched.body, fetched.url), 12000);
+      out.push(`WIKIPEDIA SEARCH URL: ${fetched.url}\nTEXT: ${text}`);
+
+      try {
+        const links = extractLinks(fetched.body, fetched.url);
+        const topArticle = pickTopWikipediaArticleUrl(links);
+        if (topArticle) {
+          const fetched2 = await safeFetchUrl(topArticle);
+          const text2 = clampTextChars(stripHtmlToText(fetched2.body, fetched2.url), 12000);
+          out.push(`WIKIPEDIA TOP ARTICLE URL: ${fetched2.url}\nTEXT: ${text2}`);
+        }
+      } catch {
+        // ignore
+      }
+    } catch {
+      // ignore
+    }
+  }
 
   if (urls.length > 0) {
     if (shouldAutoCrawlFromUserText(userText)) {
@@ -628,16 +698,43 @@ function wantsFile(text) {
   const patterns = [
     /\bmake\s+me\s+a\s+file\b/,
     /\bmake\s+a\s+file\b/,
+    /\bmake\s+(?:me\s+)?a\b(?:\s+\S+){0,8}\s+file\b/,
     /\bcreate\s+a\s+file\b/,
+    /\bcreate\s+(?:me\s+)?a\b(?:\s+\S+){0,8}\s+file\b/,
     /\bwrite\s+to\s+a\s+file\b/,
+    /\bwrite\s+(?:me\s+)?a\b(?:\s+\S+){0,8}\s+file\b/,
+    /\bgenerate\s+(?:me\s+)?a\b(?:\s+\S+){0,8}\s+file\b/,
     /\bsave\s+this\s+to\s+a\s+file\b/,
     /\bsave\s+this\s+as\s+(a\s+)?file\b/,
     /\bsave\s+it\s+as\s+(a\s+)?file\b/,
     /\bsave\s+it\s+to\s+(a\s+)?file\b/,
     /\bput\s+this\s+in\s+(a\s+)?file\b/,
     /\bwrite\s+this\s+to\s+(a\s+)?file\b/,
+    /\bupdate\s+(this\s+)?file\b/,
+    /\boverwrite\s+(this\s+)?file\b/,
+    /\bedit\s+(this\s+)?file\b/,
+    /\bmodify\s+(this\s+)?file\b/,
+    /\brevise\s+(this\s+)?file\b/,
     /\band\s+make\s+a\s+file\b/,
     /\band\s+create\s+a\s+file\b/
+  ];
+  return patterns.some(p => p.test(t));
+}
+
+function wantsOverwrite(text) {
+  const t = String(text || '').toLowerCase();
+  const patterns = [
+    /\boverwrite\b/,
+    /\breplace\b/,
+    /\bupdate\b/,
+    /\bedit\b/,
+    /\bmodify\b/,
+    /\brevise\b/,
+    /\bregenerate\b/,
+    /\bfix\s+up\b/,
+    /\bupdate\s+the\s+existing\s+file\b/,
+    /\bupdate\s+that\s+file\b/,
+    /\boverwrite\s+that\s+file\b/
   ];
   return patterns.some(p => p.test(t));
 }
@@ -1345,9 +1442,11 @@ export function startTelegramBot() {
         `You are MattyJacksBot Self Improving AI System.\n` +
         `You can help the user operate OpenClaw on Vast.ai and manage files in the synced workspace.\n` +
         `You can browse the web: the system can visit URLs, crawl websites within limits, and provide you extracted page text. Do not claim you cannot visit websites.\n` +
+        `If the user says "go to" a site/topic without providing a full URL (for example Wikipedia), ask for or request a web action in JSON web to fetch it.\n` +
         `Only create files when the user explicitly asks you to save/write/make a file.\n` +
         `When the user explicitly asks to create a file, you MUST include it in the JSON output under files.\n` +
         `If you are creating a file, put the actual file contents in files[].contents (not in response).\n` +
+        `To update an existing file, set files[].allowOverwrite=true for that entry (only if the user asked to update/overwrite/edit).\n` +
         `response should never say things like "I created a file". Instead, response should contain the useful answer itself.\n` +
         `If needed, you may request web actions in web: [{action:"visit"|"crawl"|"search", url, query, maxPages, maxDepth}].\n` +
         `You have access to a Brain index of synced files and a Brain proposal system.\n` +
@@ -1406,8 +1505,9 @@ export function startTelegramBot() {
       const fileSubdirFromModel = String(parsed?.fileSubdir || 'private');
       const filePathFromModel = String(parsed?.filePath || '').trim();
 
-      const allowFileCreation = wantsFile(text);
-      const files = allowFileCreation && Array.isArray(parsed?.files) ? parsed.files : [];
+      const inferredOverwrite = wantsOverwrite(text);
+      const allowFileWrite = wantsFile(text) || inferredOverwrite;
+      const files = allowFileWrite && Array.isArray(parsed?.files) ? parsed.files : [];
       const createdFiles = [];
       for (const f of files) {
         try {
@@ -1415,25 +1515,49 @@ export function startTelegramBot() {
           const path = String(f?.path || '');
           const contents = typeof f?.contents === 'string' ? f.contents : '';
           const instruction = String(f?.instruction || f?.title || 'created from telegram');
-          const allowOverwrite = !!f?.allowOverwrite;
+          const allowOverwrite = inferredOverwrite || !!f?.allowOverwrite;
           if (!path || !contents) continue;
-          const created = createBrainProposalFromGenerated({
-            subdir,
-            path,
-            instruction,
-            contextQuery: String(parsed?.contextQuery || ''),
-            generated: contents,
-            allowOverwrite,
-            autoApply: true,
-            applyAllowOverwrite: allowOverwrite
-          });
-          createdFiles.push({ path: `${created.target.subdir}/${created.target.path}`, proposalId: created.proposalId, applied: created.applied });
+
+          try {
+            const created = createBrainProposalFromGenerated({
+              subdir,
+              path,
+              instruction,
+              contextQuery: String(parsed?.contextQuery || ''),
+              generated: contents,
+              allowOverwrite,
+              autoApply: true,
+              applyAllowOverwrite: allowOverwrite
+            });
+            createdFiles.push({ path: `${created.target.subdir}/${created.target.path}`, proposalId: created.proposalId, applied: created.applied });
+          } catch (e) {
+            const msg = String(e?.message || '');
+            if (!allowOverwrite && msg.includes('Target already exists')) {
+              try {
+                const created = createBrainProposalFromGenerated({
+                  subdir,
+                  path,
+                  instruction,
+                  contextQuery: String(parsed?.contextQuery || ''),
+                  generated: contents,
+                  allowOverwrite: true,
+                  autoApply: true,
+                  applyAllowOverwrite: true
+                });
+                createdFiles.push({ path: `${created.target.subdir}/${created.target.path}`, proposalId: created.proposalId, applied: created.applied });
+              } catch {
+                continue;
+              }
+            } else {
+              continue;
+            }
+          }
         } catch {
           continue;
         }
       }
 
-      if (createdFiles.length === 0 && allowFileCreation) {
+      if (createdFiles.length === 0 && allowFileWrite) {
         try {
           const rel = defaultGeneratedFilePathForRequest(text);
           const targetPath = `private/${rel}`;
@@ -1444,9 +1568,9 @@ export function startTelegramBot() {
             instruction: `created from telegram request: ${text}`,
             contextQuery: String(parsed?.contextQuery || ''),
             generated: doc || response,
-            allowOverwrite: false,
+            allowOverwrite: inferredOverwrite,
             autoApply: true,
-            applyAllowOverwrite: false
+            applyAllowOverwrite: inferredOverwrite
           });
           createdFiles.push({ path: `${created.target.subdir}/${created.target.path}`, proposalId: created.proposalId, applied: created.applied });
         } catch {
