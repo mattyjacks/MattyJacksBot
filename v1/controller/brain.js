@@ -382,6 +382,10 @@ async function generateWithOllamaRemote(prompt) {
   return out;
 }
 
+export async function generateTextWithOllamaRemote(prompt) {
+  return generateWithOllamaRemote(prompt);
+}
+
 export async function createBrainProposal(options = {}) {
   const {
     subdir = 'private',

@@ -384,10 +384,8 @@ export function startServer() {
    Add this token to the UI or use it in API requests.
 `);
   });
-  
-  if (process.env.TELEGRAM_BOT_TOKEN) {
-    startTelegramBot();
-  }
+
+  startTelegramBot();
   
   return server;
 }
