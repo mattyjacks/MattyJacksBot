@@ -378,6 +378,17 @@ async function ensureGatewayRunning() {
     console.log('  Starting OpenClaw gateway...');
     await startGateway();
   } else {
+    const port = process.env.OPENCLAW_GATEWAY_PORT || '18789';
+    const portListening = await executeRemote(
+      `ss -ltnp 2>/dev/null | grep :${port} || true`,
+      { quiet: true }
+    ).catch(() => '');
+    if (!portListening.trim()) {
+      console.log(`  Gateway process found but port ${port} is not listening, restarting...`);
+      await startGateway();
+      return;
+    }
+
     const logPath = '/root/.openclaw/run/gateway.log';
     const tail = await executeRemote(`tail -n 80 ${logPath} 2>/dev/null || true`, { quiet: true }).catch(() => '');
     if (tail.includes('Invalid config at') || tail.includes('Config invalid')) {
@@ -448,10 +459,37 @@ gateway['bind'] = 'loopback'
 models = data.setdefault('models', {})
 providers = models.setdefault('providers', {})
 ollama = providers.setdefault('ollama', {})
-ollama['baseUrl'] = 'http://127.0.0.1:11434'
+ollama['baseUrl'] = 'http://127.0.0.1:11434/v1'
 ollama['apiKey'] = ollama.get('apiKey') or 'local'
-if not isinstance(ollama.get('models'), list):
-    ollama['models'] = []
+ollama['api'] = ollama.get('api') or 'openai-completions'
+
+need_models_reset = False
+existing_models = ollama.get('models')
+if not isinstance(existing_models, list) or len(existing_models) == 0:
+    need_models_reset = True
+else:
+    for m in existing_models:
+        if not isinstance(m, dict):
+            need_models_reset = True
+            break
+        if not isinstance(m.get('id'), str) or not m.get('id'):
+            need_models_reset = True
+            break
+        if not isinstance(m.get('name'), str) or not m.get('name'):
+            need_models_reset = True
+            break
+
+if need_models_reset:
+    ollama['models'] = [
+        {
+            'id': '${model}',
+            'name': '${model}',
+            'api': 'openai-completions',
+            'reasoning': False,
+            'input': ['text'],
+            'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0}
+        }
+    ]
 
 new = json.dumps(data, sort_keys=True)
 if new != orig:
