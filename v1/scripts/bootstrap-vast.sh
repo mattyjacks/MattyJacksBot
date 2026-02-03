@@ -44,10 +44,10 @@ echo "    OpenClaw $(openclaw --version 2>/dev/null || echo 'installed')"
 # Create directories
 echo "[7/7] Creating workspace..."
 mkdir -p ~/.openclaw/workspace/skills
-mkdir -p ~/moltbook/v1/sync/public
-mkdir -p ~/moltbook/v1/sync/private
-mkdir -p ~/moltbook/v1/sync/artifacts
-mkdir -p ~/moltbook/v1/sync/state
+mkdir -p ~/mattyjacksbot/v1/sync/public
+mkdir -p ~/mattyjacksbot/v1/sync/private
+mkdir -p ~/mattyjacksbot/v1/sync/artifacts
+mkdir -p ~/mattyjacksbot/v1/sync/state
 
 # Create minimal OpenClaw config if not exists
 if [ ! -f ~/.openclaw/openclaw.json ]; then
@@ -58,7 +58,7 @@ if [ ! -f ~/.openclaw/openclaw.json ]; then
   },
   "agents": {
     "defaults": {
-      "workspace": "~/moltbook/v1/agent_runtime/workspace",
+      "workspace": "~/mattyjacksbot/v1/agent_runtime/workspace",
       "sandbox": {
         "mode": "non-main"
       }

@@ -11,7 +11,7 @@ function getSyncRoot() {
   if (configuredRoot) {
     return configuredRoot.replace('%USERPROFILE%', homedir());
   }
-  return join(homedir(), 'Documents', 'Moltbook', 'v1');
+  return join(homedir(), 'Documents', 'mattyjacksbot', 'v1');
 }
 
 function ensureLocalDirectories() {
@@ -75,7 +75,7 @@ function getLocalFiles(root, subdir) {
 }
 
 async function getRemoteFiles(subdir) {
-  const remoteRoot = '~/moltbook/v1/sync';
+  const remoteRoot = '~/mattyjacksbot/v1/sync';
   
   try {
     const result = await executeRemote(
@@ -88,7 +88,7 @@ async function getRemoteFiles(subdir) {
     
     for (const line of lines) {
       const [fullPath, size, mtime] = line.split('|');
-      const relativePath = fullPath.replace(`${remoteRoot}/${subdir}/`, '').replace(/^~\/moltbook\/v1\/sync\/[^/]+\//, '');
+      const relativePath = fullPath.replace(`${remoteRoot}/${subdir}/`, '').replace(/^~\/mattyjacksbot\/v1\/sync\/[^/]+\//, '');
       
       if (relativePath && size) {
         files[relativePath] = {
@@ -223,7 +223,7 @@ export async function runSync(options = {}) {
 
 async function uploadFile(root, subdir, relativePath) {
   const localPath = join(root, subdir, relativePath);
-  const remotePath = `~/moltbook/v1/sync/${subdir}/${relativePath}`;
+  const remotePath = `~/mattyjacksbot/v1/sync/${subdir}/${relativePath}`;
   const remoteDir = remotePath.substring(0, remotePath.lastIndexOf('/'));
   
   await executeRemote(`mkdir -p ${remoteDir}`, { quiet: true });
@@ -239,7 +239,7 @@ async function uploadFile(root, subdir, relativePath) {
 
 async function downloadFile(root, subdir, relativePath) {
   const localPath = join(root, subdir, relativePath);
-  const remotePath = `~/moltbook/v1/sync/${subdir}/${relativePath}`;
+  const remotePath = `~/mattyjacksbot/v1/sync/${subdir}/${relativePath}`;
   
   const localDir = localPath.substring(0, localPath.lastIndexOf('\\'));
   if (!existsSync(localDir)) {

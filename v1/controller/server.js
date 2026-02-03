@@ -6,12 +6,17 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { randomBytes } from 'crypto';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import dotenv from 'dotenv';
 
 import { connect, getConnectionStatus, executeRemote } from './ssh.js';
 import { runSync, getSyncStatus } from './sync.js';
 import { getAgentStatus, startAgent, stopAgent, setMoltbookMode, getPendingPosts, approvePost, rejectPost } from './agent.js';
+import { getBrainStatus, indexBrain, queryBrain, listBrainProposals, createBrainProposal, applyBrainProposal } from './brain.js';
 import { startTelegramBot } from './telegram.js';
+
+const execFileAsync = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -85,8 +90,39 @@ app.get('/api/status', async (req, res) => {
       connection,
       sync,
       agent,
+      brain: getBrainStatus(),
       timestamp: new Date().toISOString()
     });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/sync/open-folder', async (req, res) => {
+  try {
+    const { folder } = req.body || {};
+    const allowed = new Set(['root', 'public', 'private', 'artifacts', 'brain']);
+    if (!allowed.has(folder)) {
+      return res.status(400).json({ error: 'Invalid folder' });
+    }
+
+    const syncStatus = await getSyncStatus();
+    const root = syncStatus.syncRoot;
+    const targetPath = folder === 'root'
+      ? root
+      : folder === 'brain'
+        ? join(root, 'artifacts', 'brain')
+        : join(root, folder);
+
+    if (process.platform === 'win32') {
+      await execFileAsync('explorer.exe', [targetPath]);
+    } else if (process.platform === 'darwin') {
+      await execFileAsync('open', [targetPath]);
+    } else {
+      await execFileAsync('xdg-open', [targetPath]);
+    }
+
+    res.json({ opened: true, path: targetPath });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -243,6 +279,67 @@ app.get('/api/config', (req, res) => {
     sandboxNonMain: process.env.SANDBOX_NON_MAIN === 'true',
     requirePostApproval: process.env.REQUIRE_POST_APPROVAL !== 'false'
   });
+});
+
+app.get('/api/brain/status', async (req, res) => {
+  try {
+    res.json(getBrainStatus());
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/brain/index', async (req, res) => {
+  try {
+    const { include } = req.body || {};
+    res.json(indexBrain({ include }));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/brain/query', async (req, res) => {
+  try {
+    const q = (req.query.q || '').toString();
+    const limit = parseInt((req.query.limit || '10').toString());
+    res.json(queryBrain(q, { limit }));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/brain/proposals', async (req, res) => {
+  try {
+    res.json(listBrainProposals());
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/brain/propose', async (req, res) => {
+  try {
+    const { subdir, path, instruction, contextQuery, allowOverwrite, autoIndex } = req.body || {};
+    const result = await createBrainProposal({
+      subdir,
+      path,
+      instruction,
+      contextQuery,
+      allowOverwrite,
+      autoIndex
+    });
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/brain/apply', async (req, res) => {
+  try {
+    const { proposalId, allowOverwrite } = req.body || {};
+    res.json(applyBrainProposal({ proposalId, allowOverwrite }));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 if (existsSync(UI_DIST)) {

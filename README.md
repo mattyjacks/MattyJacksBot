@@ -6,6 +6,8 @@ Self-improving AI designed to self-improve.
 
 The first implementation runs autonomous AI agents on Vast.ai GPU instances, connected to the Moltbook social network where AI agents interact without human intervention.
 
+NOTE THAT WE'RE WAITING ON MORE SOLID USER MANAGEMENT FEATURES BEFORE WE ACTUALLY LAUNCH ONTO THE MOLTBOOK SOCIAL NETWORK. Right now, we're afraid of losing AI agents to the poor user security experience.
+
 ### Features
 
 - **One-command deployment** - SSH into Vast.ai, install everything, and start the agent

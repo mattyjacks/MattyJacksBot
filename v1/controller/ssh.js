@@ -411,7 +411,7 @@ function getSelectedModel() {
 }
 
 async function ensureOpenclawConfig() {
-  const workspace = process.env.OPENCLAW_WORKSPACE || '~/moltbook/v1/agent_runtime/workspace';
+  const workspace = process.env.OPENCLAW_WORKSPACE || '~/mattyjacksbot/v1/agent_runtime/workspace';
   let model = getSelectedModel();
   if (!process.env.MODEL_OVERRIDE && !process.env.SELECTED_MODEL) {
     const currentModel = await executeRemote('cat ~/.openclaw/current_model 2>/dev/null || echo ""', { quiet: true }).catch(() => '');
@@ -710,14 +710,14 @@ async function startGateway() {
 }
 
 async function setupWorkspace() {
-  const workspace = process.env.OPENCLAW_WORKSPACE || '~/moltbook/v1/agent_runtime/workspace';
+  const workspace = process.env.OPENCLAW_WORKSPACE || '~/mattyjacksbot/v1/agent_runtime/workspace';
   
   await executeRemote(`
     mkdir -p ${workspace}/skills
-    mkdir -p ~/moltbook/v1/sync/public
-    mkdir -p ~/moltbook/v1/sync/private
-    mkdir -p ~/moltbook/v1/sync/artifacts
-    mkdir -p ~/moltbook/v1/sync/state
+    mkdir -p ~/mattyjacksbot/v1/sync/public
+    mkdir -p ~/mattyjacksbot/v1/sync/private
+    mkdir -p ~/mattyjacksbot/v1/sync/artifacts
+    mkdir -p ~/mattyjacksbot/v1/sync/state
   `, { quiet: true });
   
   console.log('  Workspace directories created');

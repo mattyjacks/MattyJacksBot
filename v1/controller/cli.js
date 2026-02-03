@@ -9,6 +9,7 @@ import { connect, getConnectionStatus } from './ssh.js';
 import { runSync, getSyncStatus } from './sync.js';
 import { getAgentStatus, startAgent, stopAgent } from './agent.js';
 import { tailLogs } from './logs.js';
+import { getBrainStatus, indexBrain, queryBrain, listBrainProposals, createBrainProposal, applyBrainProposal } from './brain.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -187,6 +188,137 @@ moltbookCmd
   .action(async () => {
     console.log(chalk.blue('Pending posts:'));
     // Implementation in agent.js
+  });
+
+const brainCmd = program
+  .command('brain')
+  .description('Local brain: index synced files, query context, and create/apply file proposals');
+
+brainCmd
+  .command('status')
+  .description('Show brain index status and proposal count')
+  .action(async () => {
+    try {
+      const s = getBrainStatus();
+      console.log(chalk.blue.bold('\n🧠 Brain Status\n'));
+      console.log(`  Sync root: ${s.syncRoot}`);
+      console.log(`  Brain root: ${s.brainRoot}`);
+      console.log(`  Indexed docs: ${s.indexedDocs}`);
+      console.log(`  Proposals: ${s.proposals}`);
+      console.log(`  Updated: ${s.updatedAt || 'Never'}`);
+      console.log('');
+    } catch (error) {
+      console.error(chalk.red.bold('\n✗ Brain status failed:'), error.message);
+      process.exit(1);
+    }
+  });
+
+brainCmd
+  .command('index')
+  .description('Index files from the sync folders into brain context')
+  .option('-i, --include <list>', 'Comma-separated list: public,private,artifacts', 'public,private,artifacts')
+  .action(async (options) => {
+    try {
+      const include = options.include
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+      console.log(chalk.blue.bold('\n🧠 Indexing brain...\n'));
+      const result = indexBrain({ include });
+      console.log(chalk.green(`  Updated: ${result.updated}`));
+      console.log(chalk.cyan(`  Scanned: ${result.scanned}`));
+      console.log(chalk.white(`  Indexed docs: ${result.indexedDocs}`));
+      console.log('');
+    } catch (error) {
+      console.error(chalk.red.bold('\n✗ Brain index failed:'), error.message);
+      process.exit(1);
+    }
+  });
+
+brainCmd
+  .command('query <q>')
+  .description('Search brain context')
+  .option('-l, --limit <n>', 'Max results', '10')
+  .action(async (q, options) => {
+    try {
+      const limit = parseInt(options.limit);
+      const out = queryBrain(q, { limit });
+      console.log(chalk.blue.bold(`\n🧠 Query: ${out.query}\n`));
+      for (const r of out.results) {
+        console.log(chalk.white.bold(`- ${r.docKey} (${r.score})`));
+        console.log(chalk.gray(r.preview.replace(/\n/g, '\n  ')));
+        console.log('');
+      }
+      if (!out.results || out.results.length === 0) {
+        console.log(chalk.yellow('No matches.'));
+      }
+      console.log('');
+    } catch (error) {
+      console.error(chalk.red.bold('\n✗ Brain query failed:'), error.message);
+      process.exit(1);
+    }
+  });
+
+brainCmd
+  .command('proposals')
+  .description('List brain file proposals')
+  .action(async () => {
+    try {
+      const proposals = listBrainProposals();
+      console.log(chalk.blue.bold(`\n🧠 Proposals (${proposals.length})\n`));
+      for (const p of proposals) {
+        const applied = p.appliedAt ? chalk.green('applied') : chalk.yellow('pending');
+        console.log(`${p.id}  ${applied}  ${p.target?.subdir}/${p.target?.path}  ${p.createdAt}`);
+      }
+      console.log('');
+    } catch (error) {
+      console.error(chalk.red.bold('\n✗ Listing proposals failed:'), error.message);
+      process.exit(1);
+    }
+  });
+
+brainCmd
+  .command('propose')
+  .description('Create a proposal for a new file (generated on Vast with Ollama)')
+  .requiredOption('-p, --path <path>', 'Target path relative to subdir')
+  .requiredOption('-n, --instruction <text>', 'Instruction for the file content')
+  .option('-s, --subdir <name>', 'Target subdir: public,private,artifacts', 'private')
+  .option('-c, --context <q>', 'Context query for retrieval', '')
+  .option('--overwrite', 'Allow overwriting target file (danger)', false)
+  .option('--no-auto-index', 'Do not run index before proposing')
+  .action(async (options) => {
+    try {
+      console.log(chalk.blue.bold('\n🧠 Creating proposal...\n'));
+      const result = await createBrainProposal({
+        subdir: options.subdir,
+        path: options.path,
+        instruction: options.instruction,
+        contextQuery: options.context,
+        allowOverwrite: !!options.overwrite,
+        autoIndex: !!options.autoIndex
+      });
+      console.log(chalk.green(`✓ Proposal created: ${result.proposalId}`));
+      console.log(chalk.white(`  File: artifacts/brain/proposals/${result.proposalFile}`));
+      console.log(chalk.white(`  Target: ${result.target.subdir}/${result.target.path}`));
+      console.log('');
+    } catch (error) {
+      console.error(chalk.red.bold('\n✗ Proposal failed:'), error.message);
+      process.exit(1);
+    }
+  });
+
+brainCmd
+  .command('apply <proposalId>')
+  .description('Apply a proposal to create the target file locally (writes into sync folders)')
+  .option('--overwrite', 'Allow overwriting existing target file (danger)', false)
+  .action(async (proposalId, options) => {
+    try {
+      const result = applyBrainProposal({ proposalId, allowOverwrite: !!options.overwrite });
+      console.log(chalk.green(`\n✓ Applied to: ${result.target.subdir}/${result.target.path}\n`));
+    } catch (error) {
+      console.error(chalk.red.bold('\n✗ Apply failed:'), error.message);
+      process.exit(1);
+    }
   });
 
 program.parse();

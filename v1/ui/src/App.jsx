@@ -18,7 +18,10 @@ import {
   FolderSync,
   Bot,
   ExternalLink,
-  Copy
+  Copy,
+  Brain,
+  FolderOpen,
+  Search
 } from 'lucide-react'
 
 const API_BASE = '/api'
@@ -91,6 +94,19 @@ function App() {
   const [config, setConfig] = useState(null)
   const [logs, setLogs] = useState('')
   const [pendingPosts, setPendingPosts] = useState([])
+  const [brainProposals, setBrainProposals] = useState([])
+  const [brainQuery, setBrainQuery] = useState('')
+  const [brainQueryResult, setBrainQueryResult] = useState(null)
+  const [brainIndexInclude, setBrainIndexInclude] = useState({ public: true, private: true, artifacts: true })
+  const [brainProposeForm, setBrainProposeForm] = useState({
+    subdir: 'private',
+    path: '',
+    instruction: '',
+    contextQuery: '',
+    allowOverwrite: false,
+    autoIndex: true
+  })
+  const [brainApplyOverwrite, setBrainApplyOverwrite] = useState(false)
   const [loading, setLoading] = useState({})
   const [error, setError] = useState(null)
   const [activeTab, setActiveTab] = useState('dashboard')
@@ -132,11 +148,21 @@ function App() {
       console.error('Failed to fetch pending:', err)
     }
   }
+
+  const fetchBrainProposals = async () => {
+    try {
+      const data = await fetchApi('/brain/proposals')
+      setBrainProposals(Array.isArray(data) ? data : [])
+    } catch (err) {
+      console.error('Failed to fetch brain proposals:', err)
+    }
+  }
   
   useEffect(() => {
     if (token) {
       fetchStatus()
       fetchConfig()
+      fetchBrainProposals()
       const interval = setInterval(fetchStatus, 10000)
       return () => clearInterval(interval)
     }
@@ -153,6 +179,12 @@ function App() {
   useEffect(() => {
     if (token && activeTab === 'moltbook') {
       fetchPending()
+    }
+  }, [token, activeTab])
+
+  useEffect(() => {
+    if (token && (activeTab === 'dashboard' || activeTab === 'brain')) {
+      fetchBrainProposals()
     }
   }, [token, activeTab])
   
@@ -183,6 +215,87 @@ function App() {
   
   const copyToClipboard = (text) => {
     navigator.clipboard.writeText(text)
+  }
+
+  const openSyncFolder = async (folder) => {
+    setLoading(prev => ({ ...prev, [`open-${folder}`]: true }))
+    try {
+      await fetchApi('/sync/open-folder', { method: 'POST', body: JSON.stringify({ folder }) })
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setLoading(prev => ({ ...prev, [`open-${folder}`]: false }))
+    }
+  }
+
+  const runBrainIndex = async () => {
+    setLoading(prev => ({ ...prev, brainIndex: true }))
+    try {
+      const include = Object.entries(brainIndexInclude)
+        .filter(([, v]) => !!v)
+        .map(([k]) => k)
+      await fetchApi('/brain/index', { method: 'POST', body: JSON.stringify({ include }) })
+      await fetchStatus()
+      setError(null)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setLoading(prev => ({ ...prev, brainIndex: false }))
+    }
+  }
+
+  const runBrainQuery = async () => {
+    setLoading(prev => ({ ...prev, brainQuery: true }))
+    try {
+      const q = (brainQuery || '').trim()
+      if (!q) {
+        setBrainQueryResult({ query: '', results: [] })
+        return
+      }
+      const data = await fetchApi(`/brain/query?q=${encodeURIComponent(q)}&limit=10`, { method: 'GET' })
+      setBrainQueryResult(data)
+      setError(null)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setLoading(prev => ({ ...prev, brainQuery: false }))
+    }
+  }
+
+  const runBrainPropose = async () => {
+    setLoading(prev => ({ ...prev, brainPropose: true }))
+    try {
+      const body = {
+        subdir: brainProposeForm.subdir,
+        path: brainProposeForm.path,
+        instruction: brainProposeForm.instruction,
+        contextQuery: brainProposeForm.contextQuery,
+        allowOverwrite: !!brainProposeForm.allowOverwrite,
+        autoIndex: !!brainProposeForm.autoIndex
+      }
+      await fetchApi('/brain/propose', { method: 'POST', body: JSON.stringify(body) })
+      await fetchBrainProposals()
+      await fetchStatus()
+      setError(null)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setLoading(prev => ({ ...prev, brainPropose: false }))
+    }
+  }
+
+  const runBrainApply = async (proposalId) => {
+    setLoading(prev => ({ ...prev, [`brainApply-${proposalId}`]: true }))
+    try {
+      await fetchApi('/brain/apply', { method: 'POST', body: JSON.stringify({ proposalId, allowOverwrite: !!brainApplyOverwrite }) })
+      await fetchBrainProposals()
+      await fetchStatus()
+      setError(null)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setLoading(prev => ({ ...prev, [`brainApply-${proposalId}`]: false }))
+    }
   }
   
   if (!token) {
@@ -215,6 +328,7 @@ function App() {
   
   const tabs = [
     { id: 'dashboard', label: 'Dashboard', icon: Bot },
+    { id: 'brain', label: 'Brain', icon: Brain },
     { id: 'sync', label: 'Sync', icon: FolderSync },
     { id: 'moltbook', label: 'Moltbook', icon: MessageCircle },
     { id: 'logs', label: 'Logs', icon: Terminal },
@@ -282,6 +396,197 @@ function App() {
             <button onClick={() => setError(null)} className="ml-auto text-red-400 hover:text-red-300">
               <XCircle className="w-5 h-5" />
             </button>
+          </div>
+        )}
+
+        {activeTab === 'brain' && (
+          <div className="space-y-6">
+            <div className="card">
+              <div className="flex items-center justify-between">
+                <h2 className="text-xl font-bold">Brain</h2>
+                <div className="flex gap-2">
+                  <button onClick={() => openSyncFolder('brain')} disabled={loading['open-brain']} className="btn btn-secondary flex items-center gap-2">
+                    <FolderOpen className="w-4 h-4" />
+                    Open Brain Folder
+                  </button>
+                  <button onClick={fetchBrainProposals} className="btn btn-secondary p-2" title="Refresh">
+                    <RefreshCw className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+              <p className="text-gray-400 mt-2">
+                Brain state is stored in <code className="bg-gray-800 px-2 py-1 rounded">artifacts/brain</code> and syncs with your existing system.
+              </p>
+            </div>
+
+            <div className="card">
+              <h3 className="font-semibold mb-3">Index</h3>
+              <div className="flex flex-wrap gap-2 mb-3">
+                {['public', 'private', 'artifacts'].map(k => (
+                  <label key={k} className="flex items-center gap-2 text-xs bg-gray-800 px-2 py-1 rounded">
+                    <input
+                      type="checkbox"
+                      checked={!!brainIndexInclude[k]}
+                      onChange={(e) => setBrainIndexInclude(prev => ({ ...prev, [k]: e.target.checked }))}
+                    />
+                    {k}
+                  </label>
+                ))}
+              </div>
+              <button onClick={runBrainIndex} disabled={loading.brainIndex} className="btn btn-primary">
+                {loading.brainIndex ? 'Indexing...' : 'Index Brain'}
+              </button>
+            </div>
+
+            <div className="card">
+              <h3 className="font-semibold mb-3">Query</h3>
+              <div className="flex gap-2">
+                <input
+                  className="input flex-1"
+                  placeholder="Search context..."
+                  value={brainQuery}
+                  onChange={(e) => setBrainQuery(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && runBrainQuery()}
+                />
+                <button onClick={runBrainQuery} disabled={loading.brainQuery} className="btn btn-secondary flex items-center gap-2">
+                  <Search className="w-4 h-4" />
+                  Search
+                </button>
+              </div>
+
+              {brainQueryResult?.results?.length > 0 && (
+                <div className="mt-4 space-y-3">
+                  {brainQueryResult.results.slice(0, 10).map((r, i) => (
+                    <div key={i} className="bg-gray-800 rounded-lg p-3">
+                      <div className="text-sm font-mono text-gray-200">{r.docKey}</div>
+                      <div className="text-xs text-gray-400 mt-2 whitespace-pre-wrap">{r.preview}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="card">
+              <h3 className="font-semibold mb-3">Propose New File (Private by default)</h3>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">Subdir</label>
+                  <select
+                    className="input"
+                    value={brainProposeForm.subdir}
+                    onChange={(e) => setBrainProposeForm(prev => ({ ...prev, subdir: e.target.value }))}
+                  >
+                    <option value="private">private</option>
+                    <option value="public">public</option>
+                    <option value="artifacts">artifacts</option>
+                  </select>
+                </div>
+                <div className="md:col-span-2">
+                  <label className="block text-sm text-gray-400 mb-1">Target path</label>
+                  <input
+                    className="input"
+                    placeholder="e.g. ideas/new_idea.md"
+                    value={brainProposeForm.path}
+                    onChange={(e) => setBrainProposeForm(prev => ({ ...prev, path: e.target.value }))}
+                  />
+                </div>
+                <div className="md:col-span-3">
+                  <label className="block text-sm text-gray-400 mb-1">Instruction</label>
+                  <textarea
+                    className="input h-28"
+                    placeholder="What should the file contain?"
+                    value={brainProposeForm.instruction}
+                    onChange={(e) => setBrainProposeForm(prev => ({ ...prev, instruction: e.target.value }))}
+                  />
+                </div>
+                <div className="md:col-span-3">
+                  <label className="block text-sm text-gray-400 mb-1">Context query (optional)</label>
+                  <input
+                    className="input"
+                    placeholder="e.g. sync conflict policy"
+                    value={brainProposeForm.contextQuery}
+                    onChange={(e) => setBrainProposeForm(prev => ({ ...prev, contextQuery: e.target.value }))}
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-3 mt-3">
+                <label className="flex items-center gap-2 text-sm bg-gray-800 px-3 py-2 rounded">
+                  <input
+                    type="checkbox"
+                    checked={!!brainProposeForm.autoIndex}
+                    onChange={(e) => setBrainProposeForm(prev => ({ ...prev, autoIndex: e.target.checked }))}
+                  />
+                  Auto-index before propose
+                </label>
+                <label className="flex items-center gap-2 text-sm bg-gray-800 px-3 py-2 rounded">
+                  <input
+                    type="checkbox"
+                    checked={!!brainProposeForm.allowOverwrite}
+                    onChange={(e) => setBrainProposeForm(prev => ({ ...prev, allowOverwrite: e.target.checked }))}
+                  />
+                  Allow overwrite (danger)
+                </label>
+              </div>
+
+              <button onClick={runBrainPropose} disabled={loading.brainPropose} className="btn btn-primary mt-3">
+                {loading.brainPropose ? 'Generating...' : 'Create Proposal'}
+              </button>
+            </div>
+
+            <div className="card">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="font-semibold">Proposals</h3>
+                <label className="flex items-center gap-2 text-sm bg-gray-800 px-3 py-2 rounded">
+                  <input type="checkbox" checked={brainApplyOverwrite} onChange={(e) => setBrainApplyOverwrite(e.target.checked)} />
+                  Allow overwrite on apply
+                </label>
+              </div>
+
+              {brainProposals.length === 0 ? (
+                <p className="text-gray-500">No proposals yet.</p>
+              ) : (
+                <div className="space-y-3">
+                  {brainProposals
+                    .slice()
+                    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
+                    .map((p) => (
+                      <div key={p.id} className="bg-gray-800 rounded-lg p-4">
+                        <div className="flex items-center justify-between gap-4">
+                          <div>
+                            <div className="font-mono text-sm text-gray-200">{p.id}</div>
+                            <div className="text-xs text-gray-400 mt-1">
+                              {p.target?.subdir}/{p.target?.path}
+                            </div>
+                            <div className="text-xs text-gray-500 mt-1">
+                              {p.createdAt}{p.appliedAt ? `  applied ${p.appliedAt}` : ''}
+                            </div>
+                          </div>
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => copyToClipboard(p.generated || '')}
+                              className="btn btn-secondary text-xs"
+                            >
+                              Copy Output
+                            </button>
+                            <button
+                              onClick={() => runBrainApply(p.id)}
+                              disabled={!!p.appliedAt || loading[`brainApply-${p.id}`]}
+                              className="btn btn-success text-xs"
+                            >
+                              {loading[`brainApply-${p.id}`] ? 'Applying...' : (p.appliedAt ? 'Applied' : 'Apply')}
+                            </button>
+                          </div>
+                        </div>
+                        <div className="mt-3 text-xs text-gray-400 whitespace-pre-wrap max-h-40 overflow-auto bg-gray-900 rounded p-2">
+                          {(p.generated || '').slice(0, 2000)}
+                          {(p.generated || '').length > 2000 ? '\n\n...truncated...' : ''}
+                        </div>
+                      </div>
+                    ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
         
@@ -359,6 +664,12 @@ function App() {
               >
                 <ExternalLink className="w-4 h-4" />
                 {loading.webui ? 'Checking...' : 'Open Web UI'}
+              </button>
+              <button
+                onClick={() => setActiveTab('logs')}
+                className="btn btn-secondary w-full mt-2"
+              >
+                View Logs
               </button>
               {dashboardInfo && (
                 <div className="mt-3 p-3 bg-gray-800 rounded-lg text-xs">
@@ -464,14 +775,131 @@ function App() {
                   <span className="text-gray-400">Artifacts</span>
                   <span>{status?.sync?.artifactFiles || 0}</span>
                 </div>
+                <div className="mt-2">
+                  <div className="text-gray-400">Sync root</div>
+                  <div className="flex items-center gap-2 mt-1">
+                    <code className="bg-gray-900 px-2 py-1 rounded flex-1 overflow-x-auto text-xs">{status?.sync?.syncRoot || config?.syncRoot || ''}</code>
+                    <button
+                      onClick={() => copyToClipboard(status?.sync?.syncRoot || config?.syncRoot || '')}
+                      className="p-1 hover:bg-gray-700 rounded"
+                      title="Copy"
+                    >
+                      <Copy className="w-4 h-4" />
+                    </button>
+                    <button
+                      onClick={() => openSyncFolder('root')}
+                      disabled={loading['open-root']}
+                      className="p-1 hover:bg-gray-700 rounded"
+                      title="Open"
+                    >
+                      <FolderOpen className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
               </div>
-              <button 
-                onClick={() => handleAction('sync', '/sync')}
-                disabled={loading.sync}
-                className="btn btn-primary w-full mt-4 flex items-center justify-center gap-2"
+              <div className="flex gap-2 mt-4">
+                <button 
+                  onClick={() => handleAction('sync', '/sync')}
+                  disabled={loading.sync}
+                  className="btn btn-primary flex-1 flex items-center justify-center gap-2"
+                >
+                  <RefreshCw className={`w-4 h-4 ${loading.sync ? 'animate-spin' : ''}`} />
+                  {loading.sync ? 'Syncing...' : 'Sync Now'}
+                </button>
+                <button
+                  onClick={() => handleAction('syncDry', '/sync', 'POST', { dryRun: true })}
+                  disabled={loading.syncDry}
+                  className="btn btn-secondary flex-1"
+                >
+                  {loading.syncDry ? 'Dry Run...' : 'Dry Run'}
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-2 mt-2">
+                <button onClick={() => openSyncFolder('public')} disabled={loading['open-public']} className="btn btn-secondary text-xs">Open Public</button>
+                <button onClick={() => openSyncFolder('private')} disabled={loading['open-private']} className="btn btn-secondary text-xs">Open Private</button>
+                <button onClick={() => openSyncFolder('artifacts')} disabled={loading['open-artifacts']} className="btn btn-secondary text-xs">Open Artifacts</button>
+                <button onClick={() => openSyncFolder('brain')} disabled={loading['open-brain']} className="btn btn-secondary text-xs">Open Brain</button>
+              </div>
+            </StatusCard>
+
+            <StatusCard
+              title="Brain"
+              icon={Brain}
+              status={(status?.brain?.indexedDocs || 0) > 0 ? 'success' : 'warning'}
+            >
+              <div className="space-y-2 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-gray-400">Indexed docs</span>
+                  <span>{status?.brain?.indexedDocs || 0}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-400">Proposals</span>
+                  <span>{status?.brain?.proposals || 0}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-400">Updated</span>
+                  <span>{status?.brain?.updatedAt ? new Date(status.brain.updatedAt).toLocaleString() : 'Never'}</span>
+                </div>
+              </div>
+
+              <div className="mt-4">
+                <div className="text-xs text-gray-400 mb-2">Index include</div>
+                <div className="flex flex-wrap gap-2">
+                  {['public', 'private', 'artifacts'].map(k => (
+                    <label key={k} className="flex items-center gap-2 text-xs bg-gray-800 px-2 py-1 rounded">
+                      <input
+                        type="checkbox"
+                        checked={!!brainIndexInclude[k]}
+                        onChange={(e) => setBrainIndexInclude(prev => ({ ...prev, [k]: e.target.checked }))}
+                      />
+                      {k}
+                    </label>
+                  ))}
+                </div>
+                <button
+                  onClick={runBrainIndex}
+                  disabled={loading.brainIndex}
+                  className="btn btn-primary w-full mt-2"
+                >
+                  {loading.brainIndex ? 'Indexing...' : 'Index Brain'}
+                </button>
+              </div>
+
+              <div className="mt-3">
+                <div className="flex gap-2">
+                  <input
+                    className="input flex-1"
+                    placeholder="Query context..."
+                    value={brainQuery}
+                    onChange={(e) => setBrainQuery(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && runBrainQuery()}
+                  />
+                  <button
+                    onClick={runBrainQuery}
+                    disabled={loading.brainQuery}
+                    className="btn btn-secondary p-2"
+                    title="Search"
+                  >
+                    <Search className="w-4 h-4" />
+                  </button>
+                </div>
+                {brainQueryResult?.results?.length > 0 && (
+                  <div className="mt-2 text-xs bg-gray-900 rounded p-2 max-h-36 overflow-auto">
+                    {brainQueryResult.results.slice(0, 3).map((r, i) => (
+                      <div key={i} className="mb-2">
+                        <div className="text-gray-200 font-mono">{r.docKey}</div>
+                        <div className="text-gray-400 whitespace-pre-wrap">{r.preview}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <button
+                onClick={() => setActiveTab('brain')}
+                className="btn btn-secondary w-full mt-3"
               >
-                <RefreshCw className={`w-4 h-4 ${loading.sync ? 'animate-spin' : ''}`} />
-                {loading.sync ? 'Syncing...' : 'Sync Now'}
+                Open Brain Panel
               </button>
             </StatusCard>
             
