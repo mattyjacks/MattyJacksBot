@@ -14,6 +14,7 @@ import { Readability } from '@mozilla/readability';
 let bot = null;
 let indexedOnce = false;
 const processingChats = new Set();
+const repeatTimers = new Map();
 
 function sendSafe(chatId, text, options) {
   if (!bot) return;
@@ -37,6 +38,212 @@ function getSyncRoot() {
 function ensureDir(p) {
   if (!existsSync(p)) {
     mkdirSync(p, { recursive: true });
+  }
+}
+
+function normalizeSyncRelPath(p) {
+  const safeRel = String(p || '').replace(/^[/\\]+/, '').replace(/\\/g, '/');
+  if (!safeRel || safeRel.includes('..')) return '';
+  return safeRel;
+}
+
+function extractSyncFilePathsFromText(text) {
+  const s = String(text || '');
+  const out = [];
+  const seen = new Set();
+  const re = /\b(public|private|artifacts)[/\\]([A-Za-z0-9._\-/\\]+)\b/g;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    const subdir = String(m[1] || '').trim();
+    const rel = normalizeSyncRelPath(m[2] || '');
+    if (!subdir || !rel) continue;
+    const key = `${subdir}/${rel}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ subdir, rel });
+    if (out.length >= 4) break;
+  }
+  return out;
+}
+
+function makeLocalSnippet(text, query, maxLen = 800) {
+  const s = String(text || '');
+  if (!s) return '';
+  const q = String(query || '').toLowerCase();
+  const terms = q
+    .split(/[^a-z0-9_]+/g)
+    .map(t => t.trim())
+    .filter(t => t.length >= 3)
+    .slice(0, 12);
+
+  const lower = s.toLowerCase();
+  let first = -1;
+  for (const t of terms) {
+    const i = lower.indexOf(t);
+    if (i !== -1 && (first === -1 || i < first)) first = i;
+  }
+  if (first === -1) return s.slice(0, maxLen);
+  const start = Math.max(0, first - Math.floor(maxLen / 3));
+  const end = Math.min(s.length, start + maxLen);
+  return s.slice(start, end);
+}
+
+function buildExplicitFileHintsSection(userText, options = {}) {
+  const { maxFiles = 2, maxReadBytes = 120000, maxSnippetChars = 900 } = options;
+  const syncRoot = getSyncRoot();
+  const entries = extractSyncFilePathsFromText(userText).slice(0, maxFiles);
+  if (entries.length === 0) return '';
+
+  const parts = [];
+  for (const e of entries) {
+    const abs = join(syncRoot, e.subdir, e.rel);
+    const exists = existsSync(abs);
+    let meta = `FILE PATH: ${e.subdir}/${e.rel} exists=${exists}`;
+    if (exists) {
+      try {
+        const st = statSync(abs);
+        meta += ` size=${st.size}`;
+      } catch {
+      }
+    }
+    parts.push(meta);
+
+    if (exists) {
+      try {
+        const st = statSync(abs);
+        if (st.size <= maxReadBytes) {
+          const content = readFileSync(abs, 'utf-8');
+          const snippet = clampTextChars(makeLocalSnippet(content, userText, maxSnippetChars), maxSnippetChars);
+          if (snippet) parts.push(`FILE SNIPPET: ${e.subdir}/${e.rel}\n${snippet}`);
+        }
+      } catch {
+      }
+    }
+  }
+
+  return parts.join('\n\n');
+}
+
+function buildBrainBlocks(ctxResults, userText, options = {}) {
+  const { maxFiles = 6, maxPreviewChars = 500 } = options;
+  const results = Array.isArray(ctxResults) ? ctxResults : [];
+  if (results.length === 0) return '';
+
+  const topScore = Number(results[0]?.score || 0);
+  const threshold = topScore > 0 ? Math.max(1, topScore * 0.3) : 1;
+  const filtered = results
+    .filter(r => Number(r?.score || 0) >= threshold)
+    .slice(0, maxFiles);
+
+  return filtered
+    .map(r => `FILE: ${r.docKey}\n${clampTextChars(String(r.preview || ''), maxPreviewChars)}`)
+    .join('\n\n');
+}
+
+function buildMainPrompt(parts) {
+  const {
+    history,
+    blocks,
+    explicitFileHints,
+    webContext,
+    text
+  } = parts;
+
+  const fileHintsSection = explicitFileHints ? `Explicit file status (hot-swap):\n${explicitFileHints}\n\n` : '';
+
+  return (
+    `You are MattyJacksBot Self Improving AI System.\n` +
+    `You can help the user operate OpenClaw on Vast.ai and manage files in the synced workspace.\n` +
+    `You can browse the web: the system can visit URLs, crawl websites within limits, and provide you extracted page text. Do not claim you cannot visit websites.\n` +
+    `If the user says "go to" a site/topic without providing a full URL (for example Wikipedia), ask for or request a web action in JSON web to fetch it.\n` +
+    `Only create files when the user explicitly asks you to save/write/make a file.\n` +
+    `When the user explicitly asks to create a file, you MUST include it in the JSON output under files.\n` +
+    `If you are creating a file, put the actual file contents in files[].contents (not in response).\n` +
+    `To update an existing file, set files[].allowOverwrite=true for that entry (only if the user asked to update/overwrite/edit).\n` +
+    `Use Explicit file status (hot-swap) to know whether a file exists already before proposing to update it.\n` +
+    `response should never say things like "I created a file". Instead, response should contain the useful answer itself.\n` +
+    `If needed, you may request web actions in web: [{action:"visit"|"crawl"|"search", url, query, maxPages, maxDepth}].\n` +
+    `You have access to a Brain index of synced files and a Brain proposal system.\n` +
+    `Your answer should be grounded in the provided file context and recent conversation.\n` +
+    `\n` +
+    `Conversation (recent):\n${history || '(none)'}\n\n` +
+    (blocks ? `Relevant synced file context:\n${blocks}\n\n` : '') +
+    fileHintsSection +
+    (webContext ? `Web context (auto):\n${webContext}\n\n` : '') +
+    `User message: ${text}\n\n` +
+    `Return only a single JSON object with keys: response, thinking, debug, contextQuery, files, fileIntent, fileSubdir, filePath, web.\n` +
+    `Do not include any extra commentary or markdown outside the JSON.\n` +
+    `response should be what you want the user to see by default.\n` +
+    `thinking should be a short reasoning summary (no private chain-of-thought).\n` +
+    `debug can include extra details and any internal notes.\n`
+  );
+}
+
+function buildPromptWithAutoPrune(input) {
+  const {
+    text,
+    ctxResults,
+    webContextRaw,
+    chatId,
+    modelLimit
+  } = input;
+
+  const limit = Math.max(1, parseInt(String(modelLimit || '32768')));
+  const targetTokens = Math.floor(limit * 0.5);
+  const pruneThreshold = Math.floor(limit * 0.9);
+
+  let historyLines = 18;
+  let historyChars = 6000;
+  let brainFiles = 6;
+  let brainPreviewChars = 500;
+  let webChars = 26000;
+  let hintFiles = 2;
+  let hintSnippetChars = 900;
+
+  const readHistory = () => readRecentChat(chatId, historyLines, historyChars);
+
+  let history = readHistory();
+  let explicitFileHints = buildExplicitFileHintsSection(text, { maxFiles: hintFiles, maxSnippetChars: hintSnippetChars });
+  let blocks = buildBrainBlocks(ctxResults, text, { maxFiles: brainFiles, maxPreviewChars: brainPreviewChars });
+  let webContext = clampTextChars(String(webContextRaw || ''), webChars);
+
+  let prompt = buildMainPrompt({ history, blocks, explicitFileHints, webContext, text });
+  let tokens = estimateTokens(prompt);
+
+  if (tokens <= pruneThreshold) {
+    return { prompt, promptTokens: tokens };
+  }
+
+  const knobs = [
+    () => { webChars = 9000; },
+    () => { brainFiles = 4; brainPreviewChars = 350; },
+    () => { hintFiles = 1; hintSnippetChars = 500; },
+    () => { historyLines = 12; historyChars = 4000; },
+    () => { webChars = 5000; },
+    () => { brainFiles = 3; brainPreviewChars = 240; },
+    () => { historyLines = 8; historyChars = 2500; }
+  ];
+
+  for (const adjust of knobs) {
+    adjust();
+    history = readHistory();
+    explicitFileHints = buildExplicitFileHintsSection(text, { maxFiles: hintFiles, maxSnippetChars: hintSnippetChars });
+    blocks = buildBrainBlocks(ctxResults, text, { maxFiles: brainFiles, maxPreviewChars: brainPreviewChars });
+    webContext = clampTextChars(String(webContextRaw || ''), webChars);
+
+    prompt = buildMainPrompt({ history, blocks, explicitFileHints, webContext, text });
+    tokens = estimateTokens(prompt);
+    if (tokens <= targetTokens) break;
+  }
+
+  return { prompt, promptTokens: tokens };
+}
+
+function stopRepeatForChat(chatId) {
+  const existing = repeatTimers.get(chatId);
+  if (existing) {
+    clearInterval(existing.intervalId);
+    repeatTimers.delete(chatId);
   }
 }
 
@@ -641,6 +848,11 @@ Available commands:
 /browse <root|public|private|artifacts|brain> [path] - Browse files
 /read <root|public|private|artifacts|brain> <path> - Read a file
 
+/visit <url> - Visit a web page and summarize
+/crawl <url> [maxPages] [maxDepth] - Crawl a website and summarize
+/repeat <message> - Repeat a message every minute (stops when you send a normal message)
+/repeat stop - Stop repeating
+
 /brain\_index - Index sync files into Brain
 /brain\_query <query> - Search Brain
 /brain\_proposals - List Brain proposals
@@ -948,7 +1160,8 @@ export function startTelegramBot() {
     '/brain_propose',
     '/brain_apply',
     '/visit',
-    '/crawl'
+    '/crawl',
+    '/repeat'
   ]);
   
   bot.onText(/\/start/, (msg) => {
@@ -963,6 +1176,8 @@ export function startTelegramBot() {
       bot.sendMessage(msg.chat.id, '⛔ Unauthorized. Your user ID is not in the allowed list.');
       return;
     }
+
+    stopRepeatForChat(msg.chat.id);
     
     sendSafe(msg.chat.id, getHelpMessage(msg.from.id), { parse_mode: 'Markdown' });
   });
@@ -1125,6 +1340,31 @@ export function startTelegramBot() {
     } catch (e) {
       bot.sendMessage(msg.chat.id, `❌ ${e.message}`);
     }
+  });
+
+  bot.onText(/\/repeat(?:\s+([\s\S]+))?/, (msg, match) => {
+    if (!isAuthorized(msg.from.id)) return;
+
+    const raw = String(match?.[1] || '').trim();
+    if (!raw) {
+      const running = repeatTimers.has(msg.chat.id);
+      bot.sendMessage(msg.chat.id, running ? 'Repeat is currently running. Send /repeat stop to stop it.' : 'Repeat is not running. Use /repeat <message> to start.');
+      return;
+    }
+
+    const lowered = raw.toLowerCase();
+    if (lowered === 'stop' || lowered === 'off' || lowered === 'cancel') {
+      stopRepeatForChat(msg.chat.id);
+      bot.sendMessage(msg.chat.id, 'Repeat stopped.');
+      return;
+    }
+
+    stopRepeatForChat(msg.chat.id);
+    const intervalId = setInterval(() => {
+      sendSafe(msg.chat.id, raw);
+    }, 60000);
+    repeatTimers.set(msg.chat.id, { intervalId, message: raw });
+    bot.sendMessage(msg.chat.id, 'Repeat started. It will repeat every minute and stop when you send a normal message.');
   });
 
   bot.onText(/\/brain_index/, async (msg) => {
@@ -1408,6 +1648,8 @@ export function startTelegramBot() {
       return;
     }
 
+    stopRepeatForChat(msg.chat.id);
+
     if (!isAuthorized(msg.from.id)) {
       bot.sendMessage(msg.chat.id, '⛔ Unauthorized. Your user ID is not in the allowed list.');
       return;
@@ -1427,9 +1669,7 @@ export function startTelegramBot() {
       }
 
       const outputMode = getOutputModeForUser(msg.from.id);
-      const history = readRecentChat(msg.chat.id);
-      const ctx = queryBrain(text, { limit: 6 });
-      const blocks = (ctx.results || []).slice(0, 6).map(r => `FILE: ${r.docKey}\n${r.preview}`).join('\n\n');
+      const ctx = queryBrain(text, { limit: 10 });
 
       let webContext = '';
       try {
@@ -1438,31 +1678,13 @@ export function startTelegramBot() {
         webContext = '';
       }
 
-      const prompt =
-        `You are MattyJacksBot Self Improving AI System.\n` +
-        `You can help the user operate OpenClaw on Vast.ai and manage files in the synced workspace.\n` +
-        `You can browse the web: the system can visit URLs, crawl websites within limits, and provide you extracted page text. Do not claim you cannot visit websites.\n` +
-        `If the user says "go to" a site/topic without providing a full URL (for example Wikipedia), ask for or request a web action in JSON web to fetch it.\n` +
-        `Only create files when the user explicitly asks you to save/write/make a file.\n` +
-        `When the user explicitly asks to create a file, you MUST include it in the JSON output under files.\n` +
-        `If you are creating a file, put the actual file contents in files[].contents (not in response).\n` +
-        `To update an existing file, set files[].allowOverwrite=true for that entry (only if the user asked to update/overwrite/edit).\n` +
-        `response should never say things like "I created a file". Instead, response should contain the useful answer itself.\n` +
-        `If needed, you may request web actions in web: [{action:"visit"|"crawl"|"search", url, query, maxPages, maxDepth}].\n` +
-        `You have access to a Brain index of synced files and a Brain proposal system.\n` +
-        `Your answer should be grounded in the provided file context and recent conversation.\n` +
-        `\n` +
-        `Conversation (recent):\n${history || '(none)'}\n\n` +
-        (blocks ? `Relevant synced file context:\n${blocks}\n\n` : '') +
-        (webContext ? `Web context (auto):\n${webContext}\n\n` : '') +
-        `User message: ${text}\n\n` +
-        `Return only a single JSON object with keys: response, thinking, debug, contextQuery, files, fileIntent, fileSubdir, filePath, web.\n` +
-        `Do not include any extra commentary or markdown outside the JSON.\n` +
-        `response should be what you want the user to see by default.\n` +
-        `thinking should be a short reasoning summary (no private chain-of-thought).\n` +
-        `debug can include extra details and any internal notes.\n`;
-
-      const promptTokens = estimateTokens(prompt);
+      const { prompt, promptTokens } = buildPromptWithAutoPrune({
+        text,
+        ctxResults: ctx.results || [],
+        webContextRaw: webContext,
+        chatId: msg.chat.id,
+        modelLimit: getModelContextLimit()
+      });
 
       let raw = await generateTextWithOllamaRemote(prompt);
       let parsed = safeParseJson(raw) || extractJsonObject(raw);
@@ -1622,6 +1844,11 @@ export function stopTelegramBot() {
     bot.stopPolling();
     bot = null;
   }
+
+  for (const { intervalId } of repeatTimers.values()) {
+    clearInterval(intervalId);
+  }
+  repeatTimers.clear();
 }
 
 export function sendTelegramNotification(message) {
