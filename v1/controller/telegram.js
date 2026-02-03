@@ -403,6 +403,146 @@ function stopRepeatForChat(chatId) {
   }
 }
 
+async function handleIncomingMessage(msg, options = {}) {
+  const { source = 'user' } = options;
+  const text = (msg?.text || '').trim();
+  if (!text) return;
+
+  if (processingChats.has(msg.chat.id)) {
+    if (source === 'user') {
+      bot.sendMessage(msg.chat.id, '⏳ Still working on the previous message...');
+    }
+    return;
+  }
+
+  if (source === 'user' && !text.startsWith('/')) {
+    stopRepeatForChat(msg.chat.id);
+  }
+
+  if (!isAuthorized(msg.from.id)) {
+    bot.sendMessage(msg.chat.id, '⛔ Unauthorized. Your user ID is not in the allowed list.');
+    return;
+  }
+
+  processingChats.add(msg.chat.id);
+  try {
+    appendChatLog(msg.chat.id, { t: new Date().toISOString(), role: 'user', text });
+
+    const { connected } = getConnectionStatus();
+
+    if (!indexedOnce) {
+      try { indexBrain(); indexedOnce = true; } catch { }
+    }
+
+    const outputMode = getOutputModeForUser(msg.from.id);
+    const ctx = queryBrain(text, { limit: 10 });
+
+    let webContext = '';
+    try {
+      webContext = await gatherAutoWebContext(text);
+    } catch {
+      webContext = '';
+    }
+
+    const { prompt, promptTokens } = buildPromptWithAutoPrune({
+      text,
+      ctxResults: ctx.results || [],
+      webContextRaw: webContext,
+      chatId: msg.chat.id,
+      modelLimit: getModelContextLimit()
+    });
+
+    let raw = await generateTextWithFallback(prompt);
+    if (!raw) {
+      const shortWeb = webContext ? clampTextChars(webContext, 3500) : '';
+      const note = connected
+        ? 'AI model is currently unavailable. Set OLLAMA_LOCAL_MODEL (and optionally OLLAMA_LOCAL_URL) or reconnect to Vast with /connect.'
+        : 'Vast connection is down and no local Ollama fallback is configured. Set OLLAMA_LOCAL_MODEL (and optionally OLLAMA_LOCAL_URL) or reconnect to Vast with /connect.';
+      const payload = shortWeb ? `${note}\n\nWeb context:\n${shortWeb}` : note;
+      bot.sendMessage(msg.chat.id, clampMessage(payload));
+      return;
+    }
+
+    let parsed = safeParseJson(raw) || extractJsonObject(raw);
+    if (!parsed) {
+      const retryPrompt =
+        `${prompt}\n\n` +
+        `IMPORTANT: Your entire response must be valid JSON. Output JSON only.`;
+      raw = await generateTextWithFallback(retryPrompt);
+      if (!raw) {
+        bot.sendMessage(msg.chat.id, '❌ AI error: model unavailable');
+        return;
+      }
+      parsed = safeParseJson(raw) || extractJsonObject(raw);
+    }
+
+    if (parsed && Array.isArray(parsed.web) && parsed.web.length > 0) {
+      const extraWeb = await runWebActions(parsed.web);
+      if (extraWeb) {
+        const prompt2 =
+          `${prompt}\n\n` +
+          `Additional web context (requested):\n${extraWeb}\n\n` +
+          `IMPORTANT: Return updated JSON only.`;
+        const raw2 = await generateTextWithFallback(prompt2);
+        const parsed2 = safeParseJson(raw2) || extractJsonObject(raw2);
+        if (parsed2) parsed = parsed2;
+      }
+    }
+
+    const response = parsed?.response ? String(parsed.response) : String(raw || '');
+    const thinking = parsed?.thinking ? String(parsed.thinking) : '';
+    const debug = parsed?.debug ? String(parsed.debug) : '';
+
+    const createdFiles = [];
+    if (Array.isArray(parsed?.files) && parsed.files.length > 0) {
+      for (const f of parsed.files.slice(0, 3)) {
+        try {
+          const created = await createBrainProposalFromGenerated(f, { applyNow: true });
+          createdFiles.push({ path: `${created.target.subdir}/${created.target.path}`, proposalId: created.proposalId, applied: created.applied });
+        } catch {
+        }
+      }
+    }
+
+    appendChatLog(msg.chat.id, { t: new Date().toISOString(), role: 'assistant', text: response });
+
+    let userVisible = response;
+    if (!connected && hasLocalOllamaFallbackConfigured()) {
+      userVisible += '\n\n[offline_mode] Vast disconnected, using local Ollama fallback.';
+    }
+    if (createdFiles.length > 0 && responseLooksLikeMetaAboutFile(userVisible)) {
+      userVisible = 'Done. Created the requested document.';
+    }
+    if (createdFiles.length > 0) {
+      const createdLines = createdFiles
+        .slice(0, 5)
+        .map(cf => `- ${cf.path} (proposal ${cf.proposalId}, applied: ${cf.applied})`)
+        .join('\n');
+      userVisible += `\n\nCreated files:\n${createdLines}`;
+    }
+
+    const responseTokens = estimateTokens(userVisible);
+    if (isContextFooterEnabledForUser(msg.from.id)) {
+      const limit = getModelContextLimit();
+      userVisible += `\n\n[context] prompt_est_tokens=${promptTokens} response_est_tokens=${responseTokens} model_context_limit=${limit}`;
+    }
+
+    if (outputMode === 'full') {
+      const extra = `\n\n[mode: full]\n\nThinking:\n${thinking || '(none)'}\n\nDebug:\n${debug || '(none)'}`;
+      bot.sendMessage(msg.chat.id, clampMessage(`${userVisible}${extra}`));
+    } else if (outputMode === 'thinking') {
+      const extra = `\n\n[mode: thinking]\n\nThinking:\n${thinking || '(none)'}`;
+      bot.sendMessage(msg.chat.id, clampMessage(`${userVisible}${extra}`));
+    } else {
+      bot.sendMessage(msg.chat.id, clampMessage(userVisible));
+    }
+  } catch (e) {
+    bot.sendMessage(msg.chat.id, `❌ Error: ${e.message || e}`);
+  } finally {
+    processingChats.delete(msg.chat.id);
+  }
+}
+
 function clampTextChars(text, maxChars) {
   const s = String(text || '');
   if (s.length <= maxChars) return s;
@@ -624,6 +764,16 @@ async function runWebActions(actions) {
       try {
         const results = await braveWebSearch(query, { count: 5 });
         out.push(`SEARCH QUERY: ${query}\nRESULTS:\n${formatSearchResults(results)}`);
+        const top = results.filter(r => isAllowedUrl(r.url)).slice(0, 1);
+        for (const r of top) {
+          try {
+            const fetched = await safeFetchUrl(r.url);
+            const text = clampTextChars(stripHtmlToText(fetched.body, fetched.url), 9000);
+            out.push(`TOP RESULT VISIT URL: ${fetched.url}\nTEXT: ${text}`);
+          } catch {
+            continue;
+          }
+        }
       } catch {
         continue;
       }
@@ -756,12 +906,8 @@ async function safeFetchUrl(url, options = {}) {
     }
 
     const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.length > maxBytes) {
-      throw new Error(`Response too large (${buf.length} bytes)`);
-    }
-
-    const body = buf.toString('utf-8');
-    return { url: res.url || norm, status: res.status, contentType: ct, bytes: buf.length, body };
+    if (buf.length > maxBytes) throw new Error(`Response too large (${buf.length} bytes)`);
+    return { url: res.url || norm, status: res.status, contentType: ct, bytes: buf.length, body: buf.toString('utf-8') };
   } finally {
     clearTimeout(timer);
   }
@@ -1643,11 +1789,20 @@ export function startTelegramBot() {
     }
 
     stopRepeatForChat(msg.chat.id);
-    const intervalId = setInterval(() => {
-      sendSafe(msg.chat.id, raw);
-    }, 60000);
-    repeatTimers.set(msg.chat.id, { intervalId, message: raw });
+
+    const syntheticMsg = {
+      chat: msg.chat,
+      from: msg.from,
+      text: raw
+    };
+
     bot.sendMessage(msg.chat.id, 'Repeat started. It will repeat every minute and stop when you send a normal message.');
+    handleIncomingMessage(syntheticMsg, { source: 'repeat' });
+
+    const intervalId = setInterval(() => {
+      handleIncomingMessage(syntheticMsg, { source: 'repeat' });
+    }, 60000);
+    repeatTimers.set(msg.chat.id, { intervalId, message: raw, fromId: msg.from.id });
   });
 
   bot.onText(/\/brain_index/, async (msg) => {
@@ -1916,7 +2071,7 @@ export function startTelegramBot() {
   });
 
   bot.on('message', async (msg) => {
-    const text = (msg.text || '').trim();
+    const text = (msg?.text || '').trim();
     if (!text) return;
 
     if (text.startsWith('/')) {
@@ -1931,210 +2086,7 @@ export function startTelegramBot() {
       return;
     }
 
-    stopRepeatForChat(msg.chat.id);
-
-    if (!isAuthorized(msg.from.id)) {
-      bot.sendMessage(msg.chat.id, '⛔ Unauthorized. Your user ID is not in the allowed list.');
-      return;
-    }
-
-    if (processingChats.has(msg.chat.id)) {
-      bot.sendMessage(msg.chat.id, '⏳ Still working on the previous message...');
-      return;
-    }
-
-    processingChats.add(msg.chat.id);
-    try {
-      appendChatLog(msg.chat.id, { t: new Date().toISOString(), role: 'user', text });
-
-      const { connected } = getConnectionStatus();
-
-      if (!indexedOnce) {
-        try { indexBrain(); indexedOnce = true; } catch { /* ignore */ }
-      }
-
-      const outputMode = getOutputModeForUser(msg.from.id);
-      const ctx = queryBrain(text, { limit: 10 });
-
-      let webContext = '';
-      try {
-        webContext = await gatherAutoWebContext(text);
-      } catch {
-        webContext = '';
-      }
-
-      const { prompt, promptTokens } = buildPromptWithAutoPrune({
-        text,
-        ctxResults: ctx.results || [],
-        webContextRaw: webContext,
-        chatId: msg.chat.id,
-        modelLimit: getModelContextLimit()
-      });
-
-      let raw = await generateTextWithFallback(prompt);
-      if (!raw) {
-        const shortWeb = webContext ? clampTextChars(webContext, 3500) : '';
-        const note = connected
-          ? 'AI model is currently unavailable. Set OLLAMA_LOCAL_MODEL (and optionally OLLAMA_LOCAL_URL) or reconnect to Vast with /connect.'
-          : 'Vast connection is down and no local Ollama fallback is configured. Set OLLAMA_LOCAL_MODEL (and optionally OLLAMA_LOCAL_URL) or reconnect to Vast with /connect.';
-        const payload = shortWeb ? `${note}\n\nWeb context:\n${shortWeb}` : note;
-        bot.sendMessage(msg.chat.id, clampMessage(payload));
-        return;
-      }
-      let parsed = safeParseJson(raw) || extractJsonObject(raw);
-      if (!parsed) {
-        const retryPrompt =
-          `${prompt}\n\n` +
-          `IMPORTANT: Your entire response must be valid JSON. Output JSON only.`;
-        raw = await generateTextWithFallback(retryPrompt);
-        if (!raw) {
-          bot.sendMessage(msg.chat.id, '❌ AI error: model unavailable');
-          return;
-        }
-        parsed = safeParseJson(raw) || extractJsonObject(raw);
-      }
-
-      if (parsed && Array.isArray(parsed.web) && parsed.web.length > 0) {
-        const extraWeb = await runWebActions(parsed.web);
-        if (extraWeb) {
-          const prompt2 =
-            `${prompt}\n\n` +
-            `Additional web context (requested):\n${extraWeb}\n\n` +
-            `IMPORTANT: Return updated JSON only.`;
-          raw = await generateTextWithOllamaRemote(prompt2);
-          parsed = safeParseJson(raw) || extractJsonObject(raw) || parsed;
-          webContext = clampTextChars(`${webContext}\n\n${extraWeb}`, 26000);
-        }
-      }
-
-      if (webContext) {
-        const urls = extractUrlsFromText(text);
-        const entry =
-          `# Web memory (${new Date().toISOString()})\n` +
-          `User: ${clampTextChars(text, 400)}\n\n` +
-          (urls.length > 0 ? `URLs:\n${urls.slice(0, 5).map(u => `- ${u}`).join('\n')}\n\n` : '') +
-          `Context:\n${clampTextChars(webContext, 3500)}`;
-        prependWebMemoryEntry(entry);
-      }
-
-      const response = parsed?.response ? String(parsed.response) : String(raw || '');
-      const thinking = parsed?.thinking ? String(parsed.thinking) : '';
-      const debug = parsed?.debug ? String(parsed.debug) : '';
-
-      const fileIntentFromModel = !!parsed?.fileIntent;
-      const fileSubdirFromModel = String(parsed?.fileSubdir || 'private');
-      const filePathFromModel = String(parsed?.filePath || '').trim();
-
-      const inferredOverwrite = wantsOverwrite(text);
-      const allowFileWrite = wantsFile(text) || inferredOverwrite;
-      const files = allowFileWrite && Array.isArray(parsed?.files) ? parsed.files : [];
-      const createdFiles = [];
-      for (const f of files) {
-        try {
-          const subdir = String(f?.subdir || 'private');
-          const path = String(f?.path || '');
-          const contents = typeof f?.contents === 'string' ? f.contents : '';
-          const instruction = String(f?.instruction || f?.title || 'created from telegram');
-          const allowOverwrite = inferredOverwrite || !!f?.allowOverwrite;
-          if (!path || !contents) continue;
-
-          try {
-            const created = createBrainProposalFromGenerated({
-              subdir,
-              path,
-              instruction,
-              contextQuery: String(parsed?.contextQuery || ''),
-              generated: contents,
-              allowOverwrite,
-              autoApply: true,
-              applyAllowOverwrite: allowOverwrite
-            });
-            createdFiles.push({ path: `${created.target.subdir}/${created.target.path}`, proposalId: created.proposalId, applied: created.applied });
-          } catch (e) {
-            const msg = String(e?.message || '');
-            if (!allowOverwrite && msg.includes('Target already exists')) {
-              try {
-                const created = createBrainProposalFromGenerated({
-                  subdir,
-                  path,
-                  instruction,
-                  contextQuery: String(parsed?.contextQuery || ''),
-                  generated: contents,
-                  allowOverwrite: true,
-                  autoApply: true,
-                  applyAllowOverwrite: true
-                });
-                createdFiles.push({ path: `${created.target.subdir}/${created.target.path}`, proposalId: created.proposalId, applied: created.applied });
-              } catch {
-                continue;
-              }
-            } else {
-              continue;
-            }
-          }
-        } catch {
-          continue;
-        }
-      }
-
-      if (createdFiles.length === 0 && allowFileWrite) {
-        try {
-          const rel = defaultGeneratedFilePathForRequest(text);
-          const targetPath = `private/${rel}`;
-          const doc = await generateDocumentContentsForFile(text, response, targetPath);
-          const created = createBrainProposalFromGenerated({
-            subdir: 'private',
-            path: rel,
-            instruction: `created from telegram request: ${text}`,
-            contextQuery: String(parsed?.contextQuery || ''),
-            generated: doc || response,
-            allowOverwrite: inferredOverwrite,
-            autoApply: true,
-            applyAllowOverwrite: inferredOverwrite
-          });
-          createdFiles.push({ path: `${created.target.subdir}/${created.target.path}`, proposalId: created.proposalId, applied: created.applied });
-        } catch {
-          // ignore
-        }
-      }
-
-      appendChatLog(msg.chat.id, { t: new Date().toISOString(), role: 'assistant', text: response });
-
-      let userVisible = response;
-      if (!connected && hasLocalOllamaFallbackConfigured()) {
-        userVisible += '\n\n[offline_mode] Vast disconnected, using local Ollama fallback.';
-      }
-      if (createdFiles.length > 0 && responseLooksLikeMetaAboutFile(userVisible)) {
-        userVisible = 'Done. Created the requested document.';
-      }
-      if (createdFiles.length > 0) {
-        const createdLines = createdFiles
-          .slice(0, 5)
-          .map(cf => `- ${cf.path} (proposal ${cf.proposalId}, applied: ${cf.applied})`)
-          .join('\n');
-        userVisible += `\n\nCreated files:\n${createdLines}`;
-      }
-
-      const responseTokens = estimateTokens(userVisible);
-      if (isContextFooterEnabledForUser(msg.from.id)) {
-        const limit = getModelContextLimit();
-        userVisible += `\n\n[context] prompt_est_tokens=${promptTokens} response_est_tokens=${responseTokens} model_context_limit=${limit}`;
-      }
-
-      if (outputMode === 'full') {
-        const extra = `\n\n[mode: full]\n\nThinking:\n${thinking || '(none)'}\n\nDebug:\n${debug || '(none)'}`;
-        bot.sendMessage(msg.chat.id, clampMessage(`${userVisible}${extra}`));
-      } else if (outputMode === 'thinking') {
-        const extra = `\n\n[mode: thinking]\n\nThinking:\n${thinking || '(none)'}`;
-        bot.sendMessage(msg.chat.id, clampMessage(`${userVisible}${extra}`));
-      } else {
-        bot.sendMessage(msg.chat.id, clampMessage(userVisible));
-      }
-    } catch (e) {
-      bot.sendMessage(msg.chat.id, `❌ AI error: ${e.message}`);
-    } finally {
-      processingChats.delete(msg.chat.id);
-    }
+    await handleIncomingMessage(msg, { source: 'user' });
   });
   
   return bot;
