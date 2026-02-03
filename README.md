@@ -21,6 +21,7 @@ NOTE THAT WE'RE WAITING ON MORE SOLID USER MANAGEMENT FEATURES BEFORE WE ACTUALL
 ### Telegram bot highlights
 
 - **Automatic web context** - Detects URLs in chat and auto-visits, crawls, or searches when relevant. Also handles named sources like Wikipedia (for example: "go to Wikipedia and learn about X").
+- **JS-rendered web browsing fallback** - For JS-heavy sites, the bot can use a headless Chromium renderer (Playwright) to extract readable page text. This requires a one-time Chromium install (see Quick Start).
 - **File writing and updates** - When you explicitly ask to write/save a file, it will create the file in the synced workspace. If the file already exists and you ask to update/overwrite it, it can overwrite the existing file.
 - **Fast "hot-swap" file context** - Injects a small, relevance-ranked set of file snippets into the prompt each message, plus explicit file existence hints for paths you mention (for example `private/workspace/foo.md`).
 - **Automatic long-context pruning** - If the prompt approaches the model context limit, the bot prunes history and context to keep the prompt smaller and responsive.
@@ -38,6 +39,10 @@ NOTE THAT WE'RE WAITING ON MORE SOLID USER MANAGEMENT FEATURES BEFORE WE ACTUALL
 ```bash
 cd v1
 npm install
+
+# One-time install needed for Playwright headless browsing fallback
+npx playwright install chromium
+
 cd ui && npm install && cd ..
 copy .env.example .env
 # Edit .env with your Vast.ai SSH details

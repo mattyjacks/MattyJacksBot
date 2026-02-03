@@ -1,4 +1,3 @@
-import TelegramBot from 'node-telegram-bot-api';
 import { getConnectionStatus, connect } from './ssh.js';
 import { runSync, getSyncStatus } from './sync.js';
 import { getAgentStatus, startAgent, stopAgent, setMoltbookMode, getPendingPosts, approvePost, rejectPost } from './agent.js';
@@ -15,6 +14,135 @@ let bot = null;
 let indexedOnce = false;
 const processingChats = new Set();
 const repeatTimers = new Map();
+
+class SimpleTelegramBot {
+  constructor(token, options = {}) {
+    this.token = String(token || '').trim();
+    if (!this.token) throw new Error('Missing Telegram token');
+    this.baseUrl = `https://api.telegram.org/bot${this.token}`;
+    this.textHandlers = [];
+    this.messageHandlers = [];
+    this.offset = 0;
+    this.polling = !!options.polling;
+    this.stopped = false;
+    this.inFlightController = null;
+    if (this.polling) {
+      this.startPolling();
+    }
+  }
+
+  onText(regex, callback) {
+    if (!(regex instanceof RegExp)) throw new Error('onText regex must be a RegExp');
+    if (typeof callback !== 'function') throw new Error('onText callback must be a function');
+    this.textHandlers.push({ regex, callback });
+  }
+
+  on(event, callback) {
+    if (event !== 'message') throw new Error('Only message event is supported');
+    if (typeof callback !== 'function') throw new Error('on callback must be a function');
+    this.messageHandlers.push(callback);
+  }
+
+  async sendMessage(chatId, text, options = {}) {
+    const payload = {
+      chat_id: chatId,
+      text: String(text || '')
+    };
+    if (options && options.parse_mode) payload.parse_mode = options.parse_mode;
+    if (options && options.disable_web_page_preview != null) payload.disable_web_page_preview = !!options.disable_web_page_preview;
+    if (options && options.disable_notification != null) payload.disable_notification = !!options.disable_notification;
+    return this.apiCall('sendMessage', payload, { timeoutMs: 15000 });
+  }
+
+  stopPolling() {
+    this.stopped = true;
+    if (this.inFlightController) {
+      try { this.inFlightController.abort(); } catch { }
+    }
+  }
+
+  async apiCall(method, payload, options = {}) {
+    const { timeoutMs = 30000 } = options;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(`${this.baseUrl}/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload || {}),
+        signal: controller.signal
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data || data.ok !== true) {
+        const desc = String(data?.description || res.statusText || 'Telegram API error');
+        throw new Error(desc);
+      }
+      return data.result;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async getUpdates(options = {}) {
+    const { offset = 0, timeoutSec = 45, limit = 30 } = options;
+    const controller = new AbortController();
+    this.inFlightController = controller;
+    const timer = setTimeout(() => controller.abort(), (timeoutSec * 1000) + 5000);
+    try {
+      const params = new URLSearchParams();
+      params.set('offset', String(offset));
+      params.set('timeout', String(timeoutSec));
+      params.set('limit', String(limit));
+      const url = `${this.baseUrl}/getUpdates?${params.toString()}`;
+      const res = await fetch(url, { method: 'GET', signal: controller.signal });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data || data.ok !== true) {
+        const desc = String(data?.description || res.statusText || 'Telegram getUpdates error');
+        throw new Error(desc);
+      }
+      return Array.isArray(data.result) ? data.result : [];
+    } finally {
+      clearTimeout(timer);
+      if (this.inFlightController === controller) this.inFlightController = null;
+    }
+  }
+
+  dispatchMessage(msg) {
+    const text = String(msg?.text || '');
+    for (const h of this.textHandlers) {
+      try {
+        const match = text.match(h.regex);
+        if (match) {
+          h.callback(msg, match);
+        }
+      } catch {
+      }
+    }
+
+    for (const cb of this.messageHandlers) {
+      try {
+        cb(msg);
+      } catch {
+      }
+    }
+  }
+
+  async startPolling() {
+    while (!this.stopped) {
+      try {
+        const updates = await this.getUpdates({ offset: this.offset, timeoutSec: 45, limit: 30 });
+        for (const u of updates) {
+          const id = Number(u?.update_id || 0);
+          if (id >= this.offset) this.offset = id + 1;
+          const msg = u?.message;
+          if (msg) this.dispatchMessage(msg);
+        }
+      } catch {
+        await new Promise(r => setTimeout(r, 1200));
+      }
+    }
+  }
+}
 
 function sendSafe(chatId, text, options) {
   if (!bot) return;
@@ -155,6 +283,8 @@ function buildMainPrompt(parts) {
     `You are MattyJacksBot Self Improving AI System.\n` +
     `You can help the user operate OpenClaw on Vast.ai and manage files in the synced workspace.\n` +
     `You can browse the web: the system can visit URLs, crawl websites within limits, and provide you extracted page text. Do not claim you cannot visit websites.\n` +
+    `Only claim you visited or crawled a website if the prompt includes Web context (auto) lines like VISIT URL, CRAWL URL, WIKIPEDIA, or AUTO WEB URLS. Otherwise say you have not fetched it yet.\n` +
+    `When you used web context, cite the URL(s) from AUTO WEB URLS or VISIT URL/CRAWL URL lines in your response.\n` +
     `If the user says "go to" a site/topic without providing a full URL (for example Wikipedia), ask for or request a web action in JSON web to fetch it.\n` +
     `Only create files when the user explicitly asks you to save/write/make a file.\n` +
     `When the user explicitly asks to create a file, you MUST include it in the JSON output under files.\n` +
@@ -237,6 +367,32 @@ function buildPromptWithAutoPrune(input) {
   }
 
   return { prompt, promptTokens: tokens };
+}
+
+async function generateTextWithFallback(prompt) {
+  try {
+    return await generateTextWithOllamaRemote(prompt);
+  } catch {
+    const localUrl = String(process.env.OLLAMA_LOCAL_URL || '').trim() || 'http://127.0.0.1:11434';
+    const localModel = String(process.env.OLLAMA_LOCAL_MODEL || '').trim();
+    if (!localModel) return null;
+    try {
+      const res = await fetch(`${localUrl.replace(/\/$/, '')}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: localModel, prompt, stream: false })
+      });
+      const data = await res.json();
+      return String(data?.response || '');
+    } catch {
+      return null;
+    }
+  }
+}
+
+function hasLocalOllamaFallbackConfigured() {
+  const localModel = String(process.env.OLLAMA_LOCAL_MODEL || '').trim();
+  return !!localModel;
 }
 
 function stopRepeatForChat(chatId) {
@@ -481,12 +637,17 @@ async function gatherAutoWebContext(userText) {
   const urls = extractUrlsFromText(userText);
   const out = [];
 
+  if (urls.length > 0) {
+    out.push(`AUTO WEB URLS: ${urls.slice(0, 5).join(', ')}`);
+  }
+
   if (urls.length === 0 && wantsWikipediaFromUserText(userText)) {
     const q = extractWikipediaQueryFromUserText(userText);
     const searchUrl = wikipediaSearchUrl(q);
     try {
       const fetched = await safeFetchUrl(searchUrl);
       const text = clampTextChars(stripHtmlToText(fetched.body, fetched.url), 12000);
+      out.push(`AUTO WEB URLS: ${fetched.url}`);
       out.push(`WIKIPEDIA SEARCH URL: ${fetched.url}\nTEXT: ${text}`);
 
       try {
@@ -517,9 +678,12 @@ async function gatherAutoWebContext(userText) {
     } else {
       for (const u of urls.slice(0, 2)) {
         try {
-          const fetched = await safeFetchUrl(u);
-          const text = clampTextChars(stripHtmlToText(fetched.body, fetched.url), 12000);
-          out.push(`VISIT URL: ${fetched.url}\nTEXT: ${text}`);
+          const { fetched, text } = await safeFetchUrlSmartWithRender(u);
+          const renderedFlag = fetched?.rendered ? ' rendered=true' : '';
+          out.push(`FETCH META: url=${fetched.url} status=${fetched.status} bytes=${fetched.bytes} contentType=${fetched.contentType}${renderedFlag}`);
+          const sample = clampTextChars(text, 600);
+          out.push(`VISIT URL: ${fetched.url}\nTEXT SAMPLE: ${sample}`);
+          out.push(`TEXT: ${text}`);
         } catch {
           continue;
         }
@@ -597,10 +761,119 @@ async function safeFetchUrl(url, options = {}) {
     }
 
     const body = buf.toString('utf-8');
-    return { url: res.url || norm, contentType: ct, body };
+    return { url: res.url || norm, status: res.status, contentType: ct, bytes: buf.length, body };
   } finally {
     clearTimeout(timer);
   }
+}
+
+function withWwwVariant(u) {
+  try {
+    const url = new URL(u);
+    if (url.hostname.startsWith('www.')) return u;
+    url.hostname = `www.${url.hostname}`;
+    return url.toString();
+  } catch {
+    return u;
+  }
+}
+
+function withHttpVariant(u) {
+  try {
+    const url = new URL(u);
+    if (url.protocol === 'http:') return u;
+    url.protocol = 'http:';
+    return url.toString();
+  } catch {
+    return u;
+  }
+}
+
+async function safeFetchUrlSmart(url, options = {}) {
+  const norm = normalizeUrlLike(url) || String(url || '').trim();
+  const attempts = [];
+  if (norm) attempts.push(norm);
+  if (norm) attempts.push(withWwwVariant(norm));
+  if (norm) attempts.push(withHttpVariant(norm));
+  if (norm) attempts.push(withHttpVariant(withWwwVariant(norm)));
+
+  const uniq = [];
+  const seen = new Set();
+  for (const a of attempts) {
+    const s = String(a || '').trim();
+    if (!s) continue;
+    if (seen.has(s)) continue;
+    seen.add(s);
+    uniq.push(s);
+  }
+
+  let lastErr = null;
+  for (const a of uniq.slice(0, 4)) {
+    try {
+      return await safeFetchUrl(a, options);
+    } catch (e) {
+      lastErr = e;
+      continue;
+    }
+  }
+
+  throw lastErr || new Error('Fetch failed');
+}
+
+let cachedBrowserPromise = null;
+
+async function getHeadlessBrowser() {
+  if (cachedBrowserPromise) return cachedBrowserPromise;
+
+  cachedBrowserPromise = (async () => {
+    const mod = await import('playwright');
+    const chromium = mod?.chromium;
+    if (!chromium) throw new Error('Playwright chromium not available');
+    const browser = await chromium.launch({ headless: true });
+    return browser;
+  })();
+
+  return cachedBrowserPromise;
+}
+
+async function safeFetchUrlRendered(url, options = {}) {
+  const { timeoutMs = 15000, maxBytes = 1200000 } = options;
+  const norm = normalizeUrlLike(url) || String(url || '').trim();
+  if (!isAllowedUrl(norm)) throw new Error('URL not allowed');
+
+  const browser = await getHeadlessBrowser();
+  const page = await browser.newPage();
+  try {
+    const res = await page.goto(norm, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    try {
+      await page.waitForLoadState('networkidle', { timeout: 5000 });
+    } catch {
+    }
+    const finalUrl = page.url() || norm;
+    const status = typeof res?.status === 'function' ? res.status() : 200;
+    const ct = typeof res?.headers === 'function' ? String(res.headers()?.['content-type'] || 'text/html') : 'text/html';
+    const html = await page.content();
+    const buf = Buffer.from(String(html || ''), 'utf-8');
+    if (buf.length > maxBytes) throw new Error(`Response too large (${buf.length} bytes)`);
+    return { url: finalUrl, status, contentType: ct, bytes: buf.length, body: buf.toString('utf-8'), rendered: true };
+  } finally {
+    try { await page.close(); } catch { }
+  }
+}
+
+async function safeFetchUrlSmartWithRender(url, options = {}) {
+  const fetched = await safeFetchUrlSmart(url, options);
+  const text = clampTextChars(stripHtmlToText(fetched.body, fetched.url), 12000);
+  if (text.length >= 250) return { fetched, text };
+  try {
+    const rendered = await safeFetchUrlRendered(fetched.url, options);
+    const renderedText = clampTextChars(stripHtmlToText(rendered.body, rendered.url), 12000);
+    if (renderedText.length > text.length) {
+      return { fetched: rendered, text: renderedText };
+    }
+  } catch {
+  }
+  return { fetched, text };
 }
 
 function stripHtmlToText(html, url) {
@@ -1132,7 +1405,7 @@ export function startTelegramBot() {
     return null;
   }
   
-  bot = new TelegramBot(token, { polling: true });
+  bot = new SimpleTelegramBot(token, { polling: true });
   
   console.log('🤖 Telegram bot started');
 
@@ -1285,17 +1558,22 @@ export function startTelegramBot() {
 
     bot.sendMessage(msg.chat.id, '🌐 Visiting...');
     try {
-      const fetched = await safeFetchUrl(url);
-      const pageText = clampTextChars(stripHtmlToText(fetched.body, fetched.url), 14000);
+      const fetched = await safeFetchUrlSmartWithRender(url);
+      const pageText = clampTextChars(fetched.text, 14000);
       const prompt =
         `Summarize the following web page for the user.\n` +
         `Include: what it is, key points, and any actionable items.\n` +
         `Be concise.\n\n` +
-        `URL: ${fetched.url}\n\n` +
+        `URL: ${fetched.fetched.url}\n\n` +
         `PAGE TEXT:\n${pageText}`;
 
-      const summary = await generateTextWithOllamaRemote(prompt);
-      bot.sendMessage(msg.chat.id, clampMessage(`Visited: ${fetched.url}\n\n${String(summary || '').trim()}`));
+      const summary = await generateTextWithFallback(prompt);
+      if (summary) {
+        bot.sendMessage(msg.chat.id, clampMessage(`Visited: ${fetched.fetched.url}\n\n${String(summary || '').trim()}`));
+      } else {
+        const meta = `FETCH META: url=${fetched.fetched.url} status=${fetched.fetched.status} bytes=${fetched.fetched.bytes} contentType=${fetched.fetched.contentType}${fetched.fetched.rendered ? ' rendered=true' : ''}`;
+        bot.sendMessage(msg.chat.id, clampMessage(`${meta}\n\nExtracted text:\n${pageText}`));
+      }
     } catch (e) {
       bot.sendMessage(msg.chat.id, `❌ ${e.message}`);
     }
@@ -1334,9 +1612,14 @@ export function startTelegramBot() {
         `Also provide a short list of the most relevant URLs.\n\n` +
         `CRAWL DATA:\n${joined}`;
 
-      const summary = await generateTextWithOllamaRemote(prompt);
+      const summary = await generateTextWithFallback(prompt);
       const urlsList = pages.slice(0, 10).map(p => `- ${p.url}`).join('\n');
-      bot.sendMessage(msg.chat.id, clampMessage(`Crawled ${pages.length} pages from ${url}\n\nTop URLs:\n${urlsList}\n\n${String(summary || '').trim()}`));
+      if (summary) {
+        bot.sendMessage(msg.chat.id, clampMessage(`Crawled ${pages.length} pages from ${url}\n\nTop URLs:\n${urlsList}\n\n${String(summary || '').trim()}`));
+      } else {
+        const joinedShort = clampTextChars(joined, 3500);
+        bot.sendMessage(msg.chat.id, clampMessage(`Crawled ${pages.length} pages from ${url}\n\nTop URLs:\n${urlsList}\n\nModel unavailable. Crawl text:\n${joinedShort}`));
+      }
     } catch (e) {
       bot.sendMessage(msg.chat.id, `❌ ${e.message}`);
     }
@@ -1664,6 +1947,8 @@ export function startTelegramBot() {
     try {
       appendChatLog(msg.chat.id, { t: new Date().toISOString(), role: 'user', text });
 
+      const { connected } = getConnectionStatus();
+
       if (!indexedOnce) {
         try { indexBrain(); indexedOnce = true; } catch { /* ignore */ }
       }
@@ -1686,13 +1971,26 @@ export function startTelegramBot() {
         modelLimit: getModelContextLimit()
       });
 
-      let raw = await generateTextWithOllamaRemote(prompt);
+      let raw = await generateTextWithFallback(prompt);
+      if (!raw) {
+        const shortWeb = webContext ? clampTextChars(webContext, 3500) : '';
+        const note = connected
+          ? 'AI model is currently unavailable. Set OLLAMA_LOCAL_MODEL (and optionally OLLAMA_LOCAL_URL) or reconnect to Vast with /connect.'
+          : 'Vast connection is down and no local Ollama fallback is configured. Set OLLAMA_LOCAL_MODEL (and optionally OLLAMA_LOCAL_URL) or reconnect to Vast with /connect.';
+        const payload = shortWeb ? `${note}\n\nWeb context:\n${shortWeb}` : note;
+        bot.sendMessage(msg.chat.id, clampMessage(payload));
+        return;
+      }
       let parsed = safeParseJson(raw) || extractJsonObject(raw);
       if (!parsed) {
         const retryPrompt =
           `${prompt}\n\n` +
           `IMPORTANT: Your entire response must be valid JSON. Output JSON only.`;
-        raw = await generateTextWithOllamaRemote(retryPrompt);
+        raw = await generateTextWithFallback(retryPrompt);
+        if (!raw) {
+          bot.sendMessage(msg.chat.id, '❌ AI error: model unavailable');
+          return;
+        }
         parsed = safeParseJson(raw) || extractJsonObject(raw);
       }
 
@@ -1803,6 +2101,9 @@ export function startTelegramBot() {
       appendChatLog(msg.chat.id, { t: new Date().toISOString(), role: 'assistant', text: response });
 
       let userVisible = response;
+      if (!connected && hasLocalOllamaFallbackConfigured()) {
+        userVisible += '\n\n[offline_mode] Vast disconnected, using local Ollama fallback.';
+      }
       if (createdFiles.length > 0 && responseLooksLikeMetaAboutFile(userVisible)) {
         userVisible = 'Done. Created the requested document.';
       }
