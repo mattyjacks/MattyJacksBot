@@ -354,6 +354,54 @@ function createProposalRecord(syncRoot, proposal) {
   return { id, file: fname };
 }
 
+export function createBrainProposalFromGenerated(options = {}) {
+  const {
+    subdir = 'private',
+    path,
+    instruction = '',
+    contextQuery = '',
+    generated,
+    allowOverwrite = false,
+    autoApply = false,
+    applyAllowOverwrite = false
+  } = options;
+
+  if (!path) throw new Error('Missing path');
+  if (typeof generated !== 'string') throw new Error('Missing generated');
+
+  const syncRoot = getSyncRoot();
+  const { absPath, safeRel, cleanSubdir } = resolveTargetPath(syncRoot, subdir, path);
+
+  if (!allowOverwrite && existsSync(absPath)) {
+    throw new Error(`Target already exists: ${cleanSubdir}/${safeRel}`);
+  }
+
+  const proposalId = sha256(`${cleanSubdir}/${safeRel}:${Date.now()}:${instruction || 'generated'}`).slice(0, 16);
+  const proposal = {
+    id: proposalId,
+    createdAt: new Date().toISOString(),
+    target: { subdir: cleanSubdir, path: safeRel },
+    allowOverwrite: !!allowOverwrite,
+    instruction,
+    contextQuery,
+    generated
+  };
+
+  const stored = createProposalRecord(syncRoot, proposal);
+
+  let appliedResult = null;
+  if (autoApply) {
+    appliedResult = applyBrainProposal({ proposalId: stored.id, allowOverwrite: !!(applyAllowOverwrite || allowOverwrite) });
+  }
+
+  return {
+    proposalId: stored.id,
+    proposalFile: stored.file,
+    target: proposal.target,
+    applied: !!appliedResult?.applied
+  };
+}
+
 async function generateWithOllamaRemote(prompt) {
   const { connected } = getConnectionStatus();
   if (!connected) {
