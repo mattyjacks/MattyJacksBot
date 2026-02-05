@@ -322,8 +322,8 @@ function buildPromptWithAutoPrune(input) {
   const targetTokens = Math.floor(limit * 0.5);
   const pruneThreshold = Math.floor(limit * 0.9);
 
-  let historyLines = 18;
-  let historyChars = 6000;
+  let historyLines = 40;
+  let historyChars = 20000;
   let brainFiles = 6;
   let brainPreviewChars = 500;
   let webChars = 26000;
@@ -341,7 +341,7 @@ function buildPromptWithAutoPrune(input) {
   let tokens = estimateTokens(prompt);
 
   if (tokens <= pruneThreshold) {
-    return { prompt, promptTokens: tokens };
+    return { prompt, promptTokens: tokens, pruned: false };
   }
 
   const knobs = [
@@ -366,7 +366,7 @@ function buildPromptWithAutoPrune(input) {
     if (tokens <= targetTokens) break;
   }
 
-  return { prompt, promptTokens: tokens };
+  return { prompt, promptTokens: tokens, pruned: true };
 }
 
 async function generateTextWithFallback(prompt) {
@@ -444,7 +444,7 @@ async function handleIncomingMessage(msg, options = {}) {
       webContext = '';
     }
 
-    const { prompt, promptTokens } = buildPromptWithAutoPrune({
+    const { prompt, promptTokens, pruned } = buildPromptWithAutoPrune({
       text,
       ctxResults: ctx.results || [],
       webContextRaw: webContext,
@@ -494,13 +494,110 @@ async function handleIncomingMessage(msg, options = {}) {
     const debug = parsed?.debug ? String(parsed.debug) : '';
 
     const createdFiles = [];
+    const fileFailures = [];
     if (Array.isArray(parsed?.files) && parsed.files.length > 0) {
       for (const f of parsed.files.slice(0, 3)) {
         try {
-          const created = await createBrainProposalFromGenerated(f, { applyNow: true });
+          const normTarget = normalizeModelFileTarget(f);
+          const subdir = normTarget.subdir;
+          const path = normTarget.path;
+          const instruction = String(f?.instruction || f?.title || '').trim();
+          const generated = typeof f?.contents === 'string'
+            ? f.contents
+            : (typeof f?.generated === 'string' ? f.generated : '');
+
+          if (!path || !generated) {
+            fileFailures.push(`- ${subdir}/${path || '(missing path)'} (missing path or contents)`);
+            continue;
+          }
+
+          const inferredOverwrite = wantsOverwrite(text);
+
+          const syncRoot = getSyncRoot();
+          const absTarget = join(syncRoot, subdir, path);
+          const existsBefore = existsSync(absTarget);
+
+          const allowOverwrite = inferredOverwrite || !!f?.allowOverwrite || existsBefore;
+          let finalGenerated = generated;
+          if (existsBefore) {
+            try {
+              const existingText = readFileSync(absTarget, 'utf-8');
+              finalGenerated = mergeAppendFileContents(existingText, generated);
+            } catch {
+              finalGenerated = mergeAppendFileContents('', generated);
+            }
+          }
+
+          const created = createBrainProposalFromGenerated({
+            subdir,
+            path,
+            instruction,
+            contextQuery: String(parsed?.contextQuery || ''),
+            generated: finalGenerated,
+            allowOverwrite,
+            autoApply: true,
+            applyAllowOverwrite: allowOverwrite
+          });
+
+          const abs = join(syncRoot, created.target.subdir, created.target.path);
+          const exists = existsSync(abs);
+          if (!exists || !created.applied) {
+            fileFailures.push(`- ${created.target.subdir}/${created.target.path} (apply failed)`);
+            continue;
+          }
+
           createdFiles.push({ path: `${created.target.subdir}/${created.target.path}`, proposalId: created.proposalId, applied: created.applied });
-        } catch {
+        } catch (e) {
+          const normTarget = normalizeModelFileTarget(f);
+          const subdir = normTarget.subdir;
+          const path = normTarget.path;
+          fileFailures.push(`- ${subdir}/${path || '(unknown)'} (${String(e?.message || 'error')})`);
         }
+      }
+    }
+
+    const inferredOverwrite = wantsOverwrite(text);
+    const allowFileWrite = wantsFile(text) || inferredOverwrite;
+    if (allowFileWrite && createdFiles.length === 0) {
+      try {
+        let rel = defaultGeneratedFilePathForRequest(text);
+        if (/\bself\s*-?\s*improvement\b/i.test(text)) {
+          rel = 'self_improvement/self_improvement_2026.md';
+        }
+        const targetPath = `private/${rel}`;
+        const doc = await generateDocumentContentsForFile(text, response, targetPath);
+
+        const syncRoot = getSyncRoot();
+        const absTarget = join(syncRoot, 'private', rel);
+        const existsBefore = existsSync(absTarget);
+        let finalGenerated = String(doc || response || '');
+        if (existsBefore) {
+          try {
+            const existingText = readFileSync(absTarget, 'utf-8');
+            finalGenerated = mergeAppendFileContents(existingText, finalGenerated);
+          } catch {
+            finalGenerated = mergeAppendFileContents('', finalGenerated);
+          }
+        }
+        const created = createBrainProposalFromGenerated({
+          subdir: 'private',
+          path: rel,
+          instruction: `created from telegram request: ${text}`,
+          contextQuery: String(parsed?.contextQuery || ''),
+          generated: finalGenerated,
+          allowOverwrite: inferredOverwrite || existsBefore,
+          autoApply: true,
+          applyAllowOverwrite: inferredOverwrite || existsBefore
+        });
+        const abs = join(syncRoot, created.target.subdir, created.target.path);
+        const exists = existsSync(abs);
+        if (exists && created.applied) {
+          createdFiles.push({ path: `${created.target.subdir}/${created.target.path}`, proposalId: created.proposalId, applied: created.applied });
+        } else {
+          fileFailures.push(`- ${created.target.subdir}/${created.target.path} (apply failed)`);
+        }
+      } catch (e) {
+        fileFailures.push(`- private/(auto) (${String(e?.message || 'error')})`);
       }
     }
 
@@ -509,6 +606,11 @@ async function handleIncomingMessage(msg, options = {}) {
     let userVisible = response;
     if (!connected && hasLocalOllamaFallbackConfigured()) {
       userVisible += '\n\n[offline_mode] Vast disconnected, using local Ollama fallback.';
+    }
+
+    const webSources = extractWebSourceUrlsFromWebContext(webContext);
+    if (webSources.length > 0) {
+      userVisible += `\n\nWeb sources:\n${webSources.map(u => `- ${u}`).join('\n')}`;
     }
     if (createdFiles.length > 0 && responseLooksLikeMetaAboutFile(userVisible)) {
       userVisible = 'Done. Created the requested document.';
@@ -521,10 +623,14 @@ async function handleIncomingMessage(msg, options = {}) {
       userVisible += `\n\nCreated files:\n${createdLines}`;
     }
 
+    if (createdFiles.length === 0 && fileFailures.length > 0) {
+      userVisible += `\n\nFile write failures:\n${fileFailures.slice(0, 6).join('\n')}`;
+    }
+
     const responseTokens = estimateTokens(userVisible);
     if (isContextFooterEnabledForUser(msg.from.id)) {
       const limit = getModelContextLimit();
-      userVisible += `\n\n[context] prompt_est_tokens=${promptTokens} response_est_tokens=${responseTokens} model_context_limit=${limit}`;
+      userVisible += `\n\n[context] prompt_est_tokens=${promptTokens} response_est_tokens=${responseTokens} model_context_limit=${limit} pruned=${pruned ? 'true' : 'false'}`;
     }
 
     if (outputMode === 'full') {
@@ -590,6 +696,98 @@ function extractUrlsFromText(text) {
   }
 
   return urls;
+}
+
+function extractWebSourceUrlsFromWebContext(webContext) {
+  const s = String(webContext || '');
+  if (!s.trim()) return [];
+  const urls = [];
+  const lines = s.split(/\r?\n/);
+  const prefixes = [
+    'AUTO WEB URLS:',
+    'VISIT URL:',
+    'CRAWL URL:',
+    'TOP RESULT VISIT URL:',
+    'WIKIPEDIA SEARCH URL:',
+    'WIKIPEDIA TOP ARTICLE URL:'
+  ];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const prefix = prefixes.find(p => trimmed.startsWith(p));
+    if (!prefix) continue;
+    const rest = trimmed.slice(prefix.length).trim();
+    if (!rest) continue;
+    const parts = rest.split(/\s*,\s*/g).map(x => x.trim()).filter(Boolean);
+    for (const p of parts) {
+      try {
+        const u = new URL(p);
+        urls.push(u.toString());
+      } catch {
+      }
+    }
+  }
+  const uniq = [];
+  const seen = new Set();
+  for (const u of urls) {
+    if (seen.has(u)) continue;
+    seen.add(u);
+    uniq.push(u);
+    if (uniq.length >= 8) break;
+  }
+  return uniq;
+}
+
+function pickRandomFromList(list) {
+  const arr = Array.isArray(list) ? list : [];
+  if (arr.length === 0) return null;
+  const idx = Math.floor(Math.random() * arr.length);
+  return arr[idx];
+}
+
+function normalizeModelFileTarget(f) {
+  const rawSubdir = String(f?.subdir || f?.fileSubdir || 'private').trim() || 'private';
+  const rawPath = String(f?.path || f?.filePath || '').trim();
+
+  let subdir = rawSubdir;
+  let path = rawPath;
+
+  if (subdir.includes('/')) {
+    const parts = subdir.split('/').map(s => s.trim()).filter(Boolean);
+    if (parts.length >= 2 && (parts[0] === 'private' || parts[0] === 'public' || parts[0] === 'artifacts')) {
+      subdir = parts[0];
+      path = `${parts.slice(1).join('/')}${path ? `/${path}` : ''}`;
+    }
+  }
+
+  path = path.replace(/^[\\/]+/, '').replace(/\\/g, '/');
+  if (path.startsWith('private/')) {
+    subdir = 'private';
+    path = path.slice('private/'.length);
+  } else if (path.startsWith('public/')) {
+    subdir = 'public';
+    path = path.slice('public/'.length);
+  } else if (path.startsWith('artifacts/')) {
+    subdir = 'artifacts';
+    path = path.slice('artifacts/'.length);
+  }
+
+  subdir = String(subdir || 'private').trim() || 'private';
+  if (subdir !== 'private' && subdir !== 'public' && subdir !== 'artifacts') {
+    subdir = 'private';
+  }
+
+  path = normalizeSyncRelPath(path);
+  return { subdir, path };
+}
+
+function mergeAppendFileContents(existing, addition) {
+  const prev = String(existing || '').trimEnd();
+  const next = String(addition || '').trim();
+  const stamp = new Date().toISOString();
+  const header = `\n\n## Update (${stamp})\n`;
+  if (!prev) return `${next}\n`;
+  if (!next) return `${prev}\n`;
+  return `${prev}${header}${next}\n`;
 }
 
 function isBlockedHostname(hostname) {
@@ -764,8 +962,10 @@ async function runWebActions(actions) {
       try {
         const results = await braveWebSearch(query, { count: 5 });
         out.push(`SEARCH QUERY: ${query}\nRESULTS:\n${formatSearchResults(results)}`);
-        const top = results.filter(r => isAllowedUrl(r.url)).slice(0, 1);
-        for (const r of top) {
+        const allowed = results.filter(r => isAllowedUrl(r.url)).slice(0, 4);
+        const pick = pickRandomFromList(allowed) || allowed[0];
+        const toVisit = pick ? [pick] : [];
+        for (const r of toVisit) {
           try {
             const fetched = await safeFetchUrl(r.url);
             const text = clampTextChars(stripHtmlToText(fetched.body, fetched.url), 9000);
@@ -844,9 +1044,11 @@ async function gatherAutoWebContext(userText) {
   if (shouldAutoSearchFromUserText(userText)) {
     try {
       const results = await braveWebSearch(userText, { count: 5 });
-      out.push(`SEARCH RESULTS:\n${formatSearchResults(results)}`);
-      const top = results.filter(r => isAllowedUrl(r.url)).slice(0, 1);
-      for (const r of top) {
+      out.push(`AUTO SEARCH QUERY: ${userText}\nRESULTS:\n${formatSearchResults(results)}`);
+      const allowed = results.filter(r => isAllowedUrl(r.url)).slice(0, 4);
+      const pick = pickRandomFromList(allowed) || allowed[0];
+      const toVisit = pick ? [pick] : [];
+      for (const r of toVisit) {
         try {
           const fetched = await safeFetchUrl(r.url);
           const text = clampTextChars(stripHtmlToText(fetched.body, fetched.url), 9000);
